@@ -148,8 +148,11 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
     uint32_t unix_time;
     if (rv3028_read_clock(unix_time)) return unix_time;
 
-    // getCurrentTime() is called often, and a platform whose Wire cannot issue
-    // a repeated start fails this every time, so report the fallback once.
+    // Reaching here means the transfer errored, came up short, or the decoded
+    // fields failed validation, not that the core ignored the no-stop flag:
+    // where it is ignored, endTransmission() still reports success and the
+    // read proceeds. Those causes tend to persist, and getCurrentTime() runs
+    // on every received packet, so report the fallback once.
     static bool burst_failure_logged = false;
     if (!burst_failure_logged) {
       burst_failure_logged = true;
