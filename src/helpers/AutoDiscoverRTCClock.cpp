@@ -36,14 +36,21 @@ static inline bool is_bcd(uint8_t b) {
   return (b & 0x0F) <= 9 && (b >> 4) <= 9;
 }
 
-// Read the RV-3028 clock registers in a single I2C transaction.
+// Read the RV-3028 clock registers in one burst.
 //
 // The Melopero getters read one register per transaction, so reading the time
 // field by field lets the counters roll over mid-read. Reading most-significant
 // first, an hour boundary crossed between the hour and minute reads yields a
 // timestamp a full hour in the past (e.g. 15:59:59 -> 16:00:00 reads back as
-// 15:00:00); minute and day boundaries misread in the same way. The datasheet
-// requires a burst read for this reason.
+// 15:00:00); minute and day boundaries misread in the same way.
+//
+// The fix is the single seven byte read below: those bytes come from one
+// uninterrupted transaction, so the counters cannot advance part way through.
+// Ending the pointer write without a stop additionally avoids releasing the
+// bus, but is not what makes the read coherent, and not every core honours it
+// (the STM32 core ignores the flag unless I2C_OTHER_FRAME or USE_HALV2_DRIVER
+// is defined). Where it is ignored this degrades to stop-then-start, which is
+// what readFromRegister() has always done against this part.
 //
 // Returns false if the transfer fails or the fields are not sane, leaving the
 // caller to fall back to the field-by-field path.
@@ -53,7 +60,7 @@ static bool rv3028_read_clock(uint32_t& unix_time) {
 
   wire.beginTransmission(RV3028_ADDRESS);
   wire.write((uint8_t)RV3028_REG_SECONDS);
-  if (wire.endTransmission(false) != 0) return false;  // repeated start, keeps the bus
+  if (wire.endTransmission(false) != 0) return false;  // no stop where the core honours it
 
   if (wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)RV3028_NUM_CLOCK_REGS)
         != RV3028_NUM_CLOCK_REGS) {
