@@ -394,9 +394,13 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       LocationProvider * l = _sensors->getLocationProvider();
       if (l != NULL) {
         // isEnabled() reports the GPS enable pin. A provider whose board has
-        // no enable pin (PIN_GPS_EN == -1) returns a constant true, so it is
-        // not a statement that the receiver is running: `active` is. Leading
-        // with it produced replies like "on, deactivated, no fix, 0 sats".
+        // no usable enable pin returns a constant true, so it is not a
+        // statement that the receiver is running: `active` is. Leading with it
+        // produced replies like "on, deactivated, no fix, 0 sats".
+        //
+        // "No usable enable pin" covers both spellings: PIN_GPS_EN defined as
+        // -1, and PIN_GPS_EN left undefined, which MicroNMEALocationProvider's
+        // GPS_EN fallback also resolves to -1.
         // A GPS-enabled build always has a provider, since _location is set in
         // the sensor manager's constructor, so l != NULL does not mean a
         // receiver was found. The "gps" setting is only published once one is
