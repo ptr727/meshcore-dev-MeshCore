@@ -20,6 +20,60 @@ static bool rtc_8130_success = false;
 #define PCF8563_ADDRESS  0x51
 #define RX8130CE_ADDRESS 0x32
 
+// RV-3028-C7 clock registers, contiguous from 0x00
+#define RV3028_REG_SECONDS  0x00
+#define RV3028_NUM_CLOCK_REGS  7
+
+static TwoWire* rv3028_wire = NULL;
+
+static inline uint8_t bcd_to_dec(uint8_t bcd) {
+  return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
+}
+
+// Read the RV-3028 clock registers in a single I2C transaction.
+//
+// The Melopero getters read one register per transaction, so reading the time
+// field by field lets the counters roll over mid-read. Reading most-significant
+// first, an hour boundary crossed between the hour and minute reads yields a
+// timestamp a full hour in the past (e.g. 15:59:59 -> 16:00:00 reads back as
+// 15:00:00); minute and day boundaries misread in the same way. The datasheet
+// requires a burst read for this reason.
+//
+// Returns false if the transfer fails or the fields are not sane, leaving the
+// caller to fall back to the field-by-field path.
+static bool rv3028_read_clock(uint32_t& unix_time) {
+  if (rv3028_wire == NULL) return false;
+  TwoWire& wire = *rv3028_wire;
+
+  wire.beginTransmission(RV3028_ADDRESS);
+  wire.write((uint8_t)RV3028_REG_SECONDS);
+  if (wire.endTransmission(false) != 0) return false;  // repeated start, keeps the bus
+
+  if (wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)RV3028_NUM_CLOCK_REGS)
+        != RV3028_NUM_CLOCK_REGS) {
+    return false;
+  }
+
+  uint8_t regs[RV3028_NUM_CLOCK_REGS];
+  for (uint8_t i = 0; i < RV3028_NUM_CLOCK_REGS; i++) {
+    regs[i] = wire.read();
+  }
+
+  uint8_t secs   = bcd_to_dec(regs[0] & 0x7F);
+  uint8_t mins   = bcd_to_dec(regs[1] & 0x7F);
+  uint8_t hours  = bcd_to_dec(regs[2] & 0x3F);   // begin() selects 24 hour mode
+  // regs[3] is weekday, which DateTime derives itself
+  uint8_t date   = bcd_to_dec(regs[4] & 0x3F);
+  uint8_t month  = bcd_to_dec(regs[5] & 0x1F);
+  uint8_t year   = bcd_to_dec(regs[6]);
+
+  if (secs > 59 || mins > 59 || hours > 23) return false;
+  if (date < 1 || date > 31 || month < 1 || month > 12) return false;
+
+  unix_time = DateTime(2000 + year, month, date, hours, mins, secs).unixtime();
+  return true;
+}
+
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
   wire.beginTransmission(addr);
   uint8_t error = wire.endTransmission();
@@ -36,6 +90,7 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
 
   if (i2c_probe(wire, RV3028_ADDRESS)) {
     MESH_DEBUG_PRINTLN("RV3028: Found");
+    rv3028_wire = &wire;
     rtc_rv3028.initI2C(wire);
     rtc_rv3028.writeToRegister(0x35, 0x00);
     rtc_rv3028.writeToRegister(0x37, 0xB4); // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
@@ -68,6 +123,10 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
   }
 
   if (rv3028_success) {
+    uint32_t unix_time;
+    if (rv3028_read_clock(unix_time)) return unix_time;
+
+    MESH_DEBUG_PRINTLN("RV3028: burst read failed, reading fields individually");
     return DateTime(
         rtc_rv3028.getYear(),
         rtc_rv3028.getMonth(),
