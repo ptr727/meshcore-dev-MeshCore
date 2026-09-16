@@ -672,8 +672,10 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
   const char* end = reply + HWINFO_REPLY_MAX;
 
   if (*sub == 0) {
-    dp = hwAppend(dp, end, "%s (%s, %s, %s)\n",
-                  _board->getManufacturerName(),
+    // The variant slug rather than the manufacturer name: it is the shorter and more precise of
+    // the two, and the name is already what `board` returns and what `hwinfo board` prints in
+    // full. Some board names run to 37 characters, which the 160-byte summary cannot afford.
+    dp = hwAppend(dp, end, "%s (%s, %s)\n",
                   HardwareInfo::getVariantSlug(),
                   HardwareInfo::getMCUChip(),
                   HardwareInfo::getRadioChip());

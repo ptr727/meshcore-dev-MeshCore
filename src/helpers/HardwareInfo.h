@@ -22,8 +22,6 @@
  * "none". The two are never conflated: "unknown" means nothing looked, "none" means something
  * looked and found nothing.
  */
-
-
 class HardwareInfo {
 public:
   // --- MCU ---------------------------------------------------------------------------------
@@ -136,8 +134,11 @@ public:
   // --- Board identity ----------------------------------------------------------------------
 
   /**
-   * Variant slug (the PlatformIO env's variant, e.g. "rak4631").
-   * Defined centrally at build time; "unknown" until that lands, never guessed from other flags.
+   * Variant slug -- the variant's own directory name, e.g. "rak4631".
+   *
+   * Defined for every build by variant-slug.py, which resolves it from the variants/<slug>/
+   * platformio.ini that declares the environment. An environment no variant file declares gets
+   * "unknown" rather than a value guessed from some other flag.
    */
   static const char* getVariantSlug() {
   #ifdef MC_VARIANT_SLUG
