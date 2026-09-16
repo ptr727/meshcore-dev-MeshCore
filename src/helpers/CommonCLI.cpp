@@ -61,6 +61,19 @@ static const char* gpsTransportName(const GPSInfo& gps) {
   }
 }
 
+// Prints one line of the `hwinfo all` dump. Formats into a local buffer rather than calling
+// Serial.printf(), which is not offered by every Arduino core this tree builds against -- the
+// tree's own uses of it are all inside MESH_DEBUG, which release builds never compile. Bounding
+// each line is a second benefit; printf straight to a stream bounds nothing.
+static void hwPrintLine(const char* fmt, ...) {
+  char line[96];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  Serial.println(line);
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -500,6 +513,149 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     }
 }
 
+// Everything hwinfo knows, unpaginated, straight to the serial console -- for pasting into a bug
+// report. Printed here rather than through a CommonCLICallbacks entry the way dumpLogFile() is:
+// that callback exists because a packet log lives in firmware-specific storage, whereas every
+// source here is already held by CommonCLI, so a callback would mean three example firmwares
+// carrying identical code, and a new pure virtual would break firmwares outside this tree.
+void CommonCLI::dumpHardwareInfo() {
+  hwPrintLine("--- firmware ---");
+  hwPrintLine("version   : %s", _callbacks->getFirmwareVer());
+  hwPrintLine("built     : %s", _callbacks->getBuildDate());
+  hwPrintLine("role      : %s", _callbacks->getRole());
+
+  hwPrintLine("--- board ---");
+  hwPrintLine("name      : %s", _board->getManufacturerName());
+  hwPrintLine("variant   : %s", HardwareInfo::getVariantSlug());
+  hwPrintLine("mcu       : %s (%s)", HardwareInfo::getMCUChip(), HardwareInfo::getMCUFamily());
+  hwPrintLine("radio     : %s", HardwareInfo::getRadioChip());
+  hwPrintLine("display   : %s", HardwareInfo::getDisplayName());
+  hwPrintLine("bridge    : %s", HardwareInfo::getBridgeType());
+  hwPrintLine("ethernet  : %s", HardwareInfo::hasEthernet() ? "yes" : "no");
+  {
+    char detail[48];
+    if (_board->getHardwareDetail(detail, sizeof(detail))) {
+      hwPrintLine("detail    : %s", detail);
+    }
+  }
+
+  hwPrintLine("--- power ---");
+  hwPrintLine("battery   : %u mV", _board->getBattMilliVolts());
+  hwPrintLine("ext power : %s", _board->isExternalPowered() ? "yes" : "no");
+  hwPrintLine("pwr mgt   : %s", _board->isPwrMgtInitialised() ? "initialised" : "no");
+  {
+    float t = _board->getMCUTemperature();
+    if (isnan(t)) {
+      hwPrintLine("mcu temp  : not available");
+    } else {
+      hwPrintLine("mcu temp  : %d.%01u C", (int) t, (unsigned)(fabs(t * 10)) % 10);
+    }
+  }
+  hwPrintLine("startup   : %u", _board->getStartupReason());
+  {
+    uint32_t reason = _board->getResetReason();
+    hwPrintLine("reset     : %u (%s)", reason, _board->getResetReasonString(reason));
+    uint8_t sd = _board->getShutdownReason();
+    hwPrintLine("shutdown  : %u (%s)", sd, _board->getShutdownReasonString(sd));
+  }
+  hwPrintLine("boot mV   : %u", _board->getBootVoltage());
+  {
+    // Rendered with integer maths rather than %f: float formatting is a linker option on the
+    // embedded C libraries this tree builds against, and nothing here needs it.
+    float m = _board->getAdcMultiplier();
+    hwPrintLine("adc mult  : %d.%03u", (int) m, (unsigned)(fabs(m) * 1000) % 1000);
+  }
+  {
+    char ver[32];
+    if (_board->getBootloaderVersion(ver, sizeof(ver))) {
+      hwPrintLine("bootloader: %s", ver);
+    }
+  }
+
+  hwPrintLine("--- rtc ---");
+  {
+    mesh::RTCClock* rtc = getRTCClock();
+    hwPrintLine("driver    : %s", rtc->getDriverName());
+    if (rtc->isFallbackClock()) {
+      hwPrintLine("bound     : no chip found, using fallback");
+    } else if (rtc->getDriverAddress() != 0) {
+      hwPrintLine("bound     : bus %u, address 0x%02x",
+                  rtc->getDriverBus(), rtc->getDriverAddress());
+    } else {
+      hwPrintLine("bound     : not an I2C clock");
+    }
+    hwPrintLine("time      : %u", rtc->getCurrentTime());
+  }
+
+  hwPrintLine("--- i2c ---");
+  hwPrintLine("bus0 pins : sda %d, scl %d",
+              HardwareInfo::getI2CSdaPin(), HardwareInfo::getI2CSclPin());
+  hwPrintLine("bus1 pins : sda %d, scl %d",
+              HardwareInfo::getI2C1SdaPin(), HardwareInfo::getI2C1SclPin());
+  hwPrintLine("sensor bus: %s", HardwareInfo::sensorsOnSecondaryBus() ? "Wire1" : "Wire");
+  if (!_sensors->hasHardwareInventory()) {
+    // Not the same as an empty bus: this build never scanned one.
+    hwPrintLine("scan      : unavailable (no inventory on this build)");
+  } else {
+    I2CDeviceInfo dev;
+    int total = _sensors->getNumDetectedDevices();
+    hwPrintLine("scan      : %d device(s)", total);
+    for (int i = 0; i < total && _sensors->getDetectedDevice(i, dev); i++) {
+      if (dev.name != NULL) {
+        hwPrintLine("  bus %u 0x%02x  %s (channel %u)", dev.bus, dev.address, dev.name, dev.channel);
+      } else {
+        hwPrintLine("  bus %u 0x%02x  unclaimed", dev.bus, dev.address);
+      }
+    }
+
+    hwPrintLine("--- sensors ---");
+    int n = _sensors->getNumActiveSensors();
+    hwPrintLine("active    : %d", n);
+    for (int i = 0; i < n && _sensors->getActiveSensor(i, dev); i++) {
+      hwPrintLine("  channel %u  %s at bus %u 0x%02x",
+                  dev.channel, dev.name, dev.bus, dev.address);
+    }
+  }
+
+  hwPrintLine("--- gps ---");
+  {
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
+      hwPrintLine("compiled  : no");
+    } else if (!gps.detected) {
+      hwPrintLine("detected  : no");
+      hwPrintLine("pins      : rx %d, tx %d",
+                  HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin());
+    } else {
+      const char* model = gpsModelName(gps);
+      hwPrintLine("model     : %s", model != NULL ? model : "not identified");
+      hwPrintLine("transport : %s", gpsTransportName(gps));
+      if (gps.transport == GPS_TRANSPORT_I2C) {
+        hwPrintLine("i2c       : bus %u, address 0x%02x", gps.bus, gps.address);
+      } else {
+        hwPrintLine("uart      : rx %d, tx %d, %u baud",
+                    HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin(), gps.baud);
+      }
+      // Reported as wired. A -1 pin is a fact about the board, not a problem to diagnose here.
+      if (gps.enable_pin != -1) {
+        hwPrintLine("enable pin: %d (active %s)", gps.enable_pin,
+                    gps.enable_active_high ? "high" : "low");
+      } else {
+        hwPrintLine("enable pin: -1");
+      }
+      hwPrintLine("reset pin : %d", gps.reset_pin);
+      hwPrintLine("power rail: %s", gps.shared_rail ? "shared, ref-counted" : "dedicated pin");
+      hwPrintLine("state     : %s", gps.active ? "active" : "idle");
+      LocationProvider* loc = _sensors->getLocationProvider();
+      if (loc != NULL) {
+        hwPrintLine("fix       : %s, %ld satellite(s)",
+                    loc->isValid() ? "yes" : "no", loc->satellitesCount());
+        hwPrintLine("enabled   : %s", loc->isEnabled() ? "yes" : "no");
+      }
+    }
+  }
+}
+
 // Reports what the firmware is and what hardware it actually found. Everything here must work on
 // a release build: these discoveries are already made at boot, but are announced only through
 // MESH_DEBUG_PRINTLN, which a release build compiles away. See docs/cli_commands.md.
@@ -707,8 +863,17 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
                     loc->isValid() ? "fix" : "no fix",
                     loc->satellitesCount());
     }
+  } else if (strcmp(sub, "all") == 0) {
+    // Serial only, like `log` and the `stats-*` commands: the dump is many lines and would be
+    // truncated to nonsense inside a single mesh packet.
+    if (sender_timestamp != 0) {
+      strcpy(reply, "hwinfo all: serial only");
+      return;
+    }
+    dumpHardwareInfo();
+    strcpy(reply, "   EOF");
   } else {
-    strcpy(reply, "Usage: hwinfo [board|i2c|sensors|gps] [start]");
+    strcpy(reply, "Usage: hwinfo [board|i2c|sensors|gps|all] [start]");
   }
 }
 
