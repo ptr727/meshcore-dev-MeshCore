@@ -76,6 +76,11 @@ public:
   virtual const char* getShutdownReasonString(uint8_t reason) { return "Not available"; }
 
   virtual bool handleCommand(const char* command, uint32_t sender_timestamp, char* reply) { return false; }
+
+  // Reporting only: append board-specific hardware detail for `hwinfo` (eg. a front-end module's
+  // presence and state), at most max_len bytes including the terminator. Returns false when the
+  // board has nothing extra to say, which is the default, so no board need implement it.
+  virtual bool getHardwareDetail(char* out, size_t max_len) { return false; }
 };
 
 /**

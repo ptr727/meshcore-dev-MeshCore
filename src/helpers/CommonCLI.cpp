@@ -3,7 +3,9 @@
 #include "TxtDataHelpers.h"
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
+#include "HardwareInfo.h"
 #include <RTClib.h>
+#include <stdarg.h>
 
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
@@ -17,6 +19,26 @@ static uint32_t _atoi(const char* sp) {
     n += (*sp++ - '0');
   }
   return n;
+}
+
+// Smallest reply buffer any caller gives us: 160 bytes on the serial CLI
+// (examples/simple_repeater/main.cpp) and 161 over remote admin, where it must also fit a single
+// mesh packet (MyMesh.cpp builds it inside a uint8_t[166] at offset 5).
+#define HWINFO_REPLY_MAX  160
+
+// Appends to dp within [dp, end) and returns the new write position, truncating rather than
+// overrunning. The surrounding CLI formats replies with unbounded sprintf; hwinfo does not widen
+// that pattern, because it is the one command whose output length is driven by how much hardware
+// a board happens to have.
+static char* hwAppend(char* dp, const char* end, const char* fmt, ...) {
+  if (dp >= end - 1) return dp;   // no room for anything but the terminator
+  va_list args;
+  va_start(args, fmt);
+  int n = vsnprintf(dp, end - dp, fmt, args);
+  va_end(args);
+  if (n < 0) return dp;                            // encoding error, leave dp where it was
+  if (n >= end - dp) return (char *) end - 1;      // truncated; vsnprintf already terminated
+  return dp + n;
 }
 
 static bool isValidName(const char *n) {
@@ -284,6 +306,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       sprintf(reply, "%s (Build: %s)", _callbacks->getFirmwareVer(), _callbacks->getBuildDate());
     } else if (memcmp(command, "board", 5) == 0) {
       sprintf(reply, "%s", _board->getManufacturerName());
+    } else if (memcmp(command, "hwinfo", 6) == 0 && (command[6] == 0 || command[6] == ' ')) {
+      handleHwInfoCmd(sender_timestamp, command, reply);
     } else if (memcmp(command, "sensor get ", 11) == 0) {
       const char* key = command + 11;
       const char* val = _sensors->getSettingByKey(key);
@@ -454,6 +478,57 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else {
       strcpy(reply, "Unknown command");
     }
+}
+
+// Reports what the firmware is and what hardware it actually found. Everything here must work on
+// a release build: these discoveries are already made at boot, but are announced only through
+// MESH_DEBUG_PRINTLN, which a release build compiles away. See docs/cli_commands.md.
+//
+// The summary is deliberately five short lines. Both transports cap a reply at 160 bytes, and a
+// fully populated summary of the widest board in the tree measures 150, so the verbose identity
+// fields (build date, display, board-specific detail) live under `hwinfo board` instead, which
+// gets a budget of its own.
+void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* reply) {
+  const char* sub = &command[6];
+  while (*sub == ' ') sub++;
+
+  char* dp = reply;
+  const char* end = reply + HWINFO_REPLY_MAX;
+
+  if (*sub == 0) {
+    dp = hwAppend(dp, end, "%s (%s, %s, %s)\n",
+                  _board->getManufacturerName(),
+                  HardwareInfo::getVariantSlug(),
+                  HardwareInfo::getMCUChip(),
+                  HardwareInfo::getRadioChip());
+    dp = hwAppend(dp, end, "fw %s %s\n", _callbacks->getFirmwareVer(), _callbacks->getRole());
+
+    // TODO(hwinfo): §6.2 binds rtc, §6.3 binds i2c/sensors, §6.4 binds gps state. Until then "?"
+    // marks a field nothing has reported yet -- it must never be read as "none found".
+    dp = hwAppend(dp, end, "rtc ?\n");
+    if (HardwareInfo::isGPSCompiledIn()) {
+      dp = hwAppend(dp, end, "gps ?\n");
+    } else {
+      dp = hwAppend(dp, end, "gps not compiled in\n");
+    }
+    dp = hwAppend(dp, end, "i2c ? dev, ? sensor");
+  } else if (strcmp(sub, "board") == 0) {
+    dp = hwAppend(dp, end, "%s (%s)\n",
+                  _board->getManufacturerName(), HardwareInfo::getVariantSlug());
+    dp = hwAppend(dp, end, "mcu %s, radio %s\n",
+                  HardwareInfo::getMCUChip(), HardwareInfo::getRadioChip());
+    dp = hwAppend(dp, end, "disp %s\n", HardwareInfo::getDisplayName());
+    dp = hwAppend(dp, end, "built %s", _callbacks->getBuildDate());
+
+    // A board with hardware the generic report cannot see appends it here. Boards that override
+    // nothing contribute nothing, which is every board bar those with a controllable front end.
+    char detail[48];
+    if (_board->getHardwareDetail(detail, sizeof(detail))) {
+      dp = hwAppend(dp, end, "\n%s", detail);
+    }
+  } else {
+    strcpy(reply, "Usage: hwinfo [board]");
+  }
 }
 
 void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {
