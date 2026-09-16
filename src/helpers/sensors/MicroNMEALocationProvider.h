@@ -130,7 +130,7 @@ public :
     // plausible looking one: date2days(0,0,0) evaluates to -1, which wraps its
     // uint16_t return to 65535, so unixtime() comes back as 2314303943, i.e.
     // 3 May 2043. Report 0 instead, so a caller can tell there is no time yet.
-    long getTimestamp() override {
+    uint32_t getTimestamp() override {
         uint16_t year = nmea.getYear();
         uint8_t month = nmea.getMonth();
         uint8_t day = nmea.getDay();
@@ -174,8 +174,8 @@ public :
                 if (_clock != NULL) {
                     // Leave _time_sync_needed set if there is no time yet, so
                     // the next pass retries rather than the sync being consumed.
-                    long timestamp = getTimestamp();
-                    if (timestamp > 0) {
+                    uint32_t timestamp = getTimestamp();
+                    if (timestamp != 0) {
                         _clock->setCurrentTime(timestamp);
                         _time_sync_needed = false;
                         _last_time_sync = millis();
