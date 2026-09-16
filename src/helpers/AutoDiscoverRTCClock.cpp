@@ -30,6 +30,12 @@ static inline uint8_t bcd_to_dec(uint8_t bcd) {
   return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
 }
 
+// A corrupt register can hold a non-BCD nibble that still decodes into a
+// plausible range (0x0A decodes to 10), so check the nibbles themselves.
+static inline bool is_bcd(uint8_t b) {
+  return (b & 0x0F) <= 9 && (b >> 4) <= 9;
+}
+
 // Read the RV-3028 clock registers in a single I2C transaction.
 //
 // The Melopero getters read one register per transaction, so reading the time
@@ -59,22 +65,27 @@ static bool rv3028_read_clock(uint32_t& unix_time) {
     regs[i] = wire.read();
   }
 
-  uint8_t secs   = bcd_to_dec(regs[0] & 0x7F);
-  uint8_t mins   = bcd_to_dec(regs[1] & 0x7F);
-  uint8_t hours  = bcd_to_dec(regs[2] & 0x3F);   // begin() selects 24 hour mode
+  const uint8_t secs  = regs[0] & 0x7F;
+  const uint8_t mins  = regs[1] & 0x7F;
+  const uint8_t hours = regs[2] & 0x3F;   // begin() selects 24 hour mode
   // regs[3] is weekday, which DateTime derives itself
-  uint8_t date   = bcd_to_dec(regs[4] & 0x3F);
-  uint8_t month  = bcd_to_dec(regs[5] & 0x1F);
-  uint8_t year   = bcd_to_dec(regs[6]);
+  const uint8_t date  = regs[4] & 0x3F;
+  const uint8_t month = regs[5] & 0x1F;
+  const uint8_t year  = regs[6];
 
-  // A corrupt register decodes out of range rather than failing the transfer,
-  // so range-check every field. year is 0..99 because DateTime only spans
-  // 2000..2099, and a non-BCD byte such as 0xFF decodes to 165.
-  if (secs > 59 || mins > 59 || hours > 23) return false;
-  if (date < 1 || date > 31 || month < 1 || month > 12) return false;
-  if (year > 99) return false;
+  if (!is_bcd(secs) || !is_bcd(mins) || !is_bcd(hours)
+      || !is_bcd(date) || !is_bcd(month) || !is_bcd(year)) {
+    return false;
+  }
 
-  unix_time = DateTime(2000 + year, month, date, hours, mins, secs).unixtime();
+  DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
+              bcd_to_dec(hours), bcd_to_dec(mins), bcd_to_dec(secs));
+
+  // isValid() round-trips through unixtime(), so it rejects out of range
+  // fields and impossible dates such as 31 February in one check.
+  if (!dt.isValid()) return false;
+
+  unix_time = dt.unixtime();
   return true;
 }
 
