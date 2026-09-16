@@ -300,6 +300,23 @@ into a bug report, and replies `   EOF` when done. Over remote admin it replies
 | `no more` | `start` is past the end of the list |
 | `Usage: hwinfo [board\|i2c\|sensors\|gps\|all] [start]` | unrecognised sub-command |
 
+#### Limitations
+
+`hwinfo` reports what the firmware concluded at boot. Two cases where that is less than the whole
+truth, both inherited from how detection works rather than from the reporting:
+
+- **A device name is the driver that claimed the address, not the silicon.** Several drivers share
+  an address — BME680, BME680+BSEC, BME280 and BMP280 are all probed at `0x76` (and `0x77`) — and
+  the first one whose initialisation succeeds wins. The name reported is that winner, which need
+  not be the part actually fitted. Distinguishing them would need a chip-ID register read, which
+  is a change to detection rather than to reporting.
+- **A GNSS receiver on a UART is never identified.** Detection concludes only that something is
+  sending data on the port, so no model is reported for it. Only the RAK12500 on I2C is probed by
+  name and therefore named.
+
+An address reported as `unclaimed` is exactly that: it answered, and no driver in this build
+recognised it.
+
 ---
 
 ## Configuration
