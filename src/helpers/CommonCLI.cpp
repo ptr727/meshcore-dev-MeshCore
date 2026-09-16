@@ -46,6 +46,21 @@ static char* hwAppend(char* dp, const char* end, const char* fmt, ...) {
   return dp + n;
 }
 
+// A GNSS receiver's model is only known where the driver identified it. The RAK12500 is probed
+// by name on I2C, so it can be stated; a UART receiver is never identified -- MeshCore reads NMEA
+// without asking what is sending it -- so NULL is returned and nothing is claimed about it.
+static const char* gpsModelName(const GPSInfo& gps) {
+  return (gps.transport == GPS_TRANSPORT_I2C && gps.address == 0x42) ? "RAK12500" : NULL;
+}
+
+static const char* gpsTransportName(const GPSInfo& gps) {
+  switch (gps.transport) {
+    case GPS_TRANSPORT_I2C:  return "i2c";
+    case GPS_TRANSPORT_UART: return "uart";
+    default:                 return "unknown";
+  }
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -520,12 +535,26 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       dp = hwAppend(dp, end, "rtc %s\n", rtc->getDriverName());
     }
 
-    // TODO(hwinfo): §6.4 binds gps state. Until then "?" marks a field nothing has reported yet
-    // -- it must never be read as "none found".
-    if (HardwareInfo::isGPSCompiledIn()) {
-      dp = hwAppend(dp, end, "gps ?\n");
-    } else {
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
       dp = hwAppend(dp, end, "gps not compiled in\n");
+    } else if (!gps.detected) {
+      dp = hwAppend(dp, end, "gps not detected\n");
+    } else {
+      const char* model = gpsModelName(gps);
+      if (model != NULL) {
+        dp = hwAppend(dp, end, "gps %s %s", model, gpsTransportName(gps));
+      } else {
+        dp = hwAppend(dp, end, "gps %s", gpsTransportName(gps));
+      }
+      dp = hwAppend(dp, end, " %s", gps.active ? "active" : "idle");
+      // Fix and satellite count come from the provider, which is the only thing that knows.
+      LocationProvider* loc = _sensors->getLocationProvider();
+      if (loc != NULL) {
+        dp = hwAppend(dp, end, " %s %ldsat", loc->isValid() ? "fix" : "nofix",
+                      loc->satellitesCount());
+      }
+      dp = hwAppend(dp, end, "\n");
     }
 
     // A manager that never scanned a bus reports "unavailable", never "0 dev" -- claiming a bus
@@ -574,11 +603,19 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       char* row = dp;
       dp = hwAppend(dp, end, "b%d 0x%02x ", dev.bus, dev.address);
       mesh::RTCClock* rtc = getRTCClock();
+      GPSInfo gps;
+      bool is_gps = _sensors->getGPSInfo(gps) && gps.detected
+                    && gps.transport == GPS_TRANSPORT_I2C
+                    && gps.address == dev.address && gps.bus == dev.bus;
       if (dev.name != NULL && dev.channel != 0) {
         dp = hwAppend(dp, end, "%s ch%d\n", dev.name, dev.channel);
       } else if (!rtc->isFallbackClock()
                  && rtc->getDriverAddress() == dev.address && rtc->getDriverBus() == dev.bus) {
         dp = hwAppend(dp, end, "%s (rtc)\n", rtc->getDriverName());
+      } else if (is_gps) {
+        // The GNSS is not in SENSOR_TABLE, so without this it would read as unclaimed.
+        const char* model = gpsModelName(gps);
+        dp = hwAppend(dp, end, "%s (gps)\n", model != NULL ? model : "unknown");
       } else {
         // Answered, claimed by nobody. This is the line worth having: something is on the bus
         // and the firmware does not know what it is.
@@ -630,8 +667,48 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
     } else if (dp > reply) {
       *(dp-1) = 0;  // remove last CR
     }
+  } else if (strcmp(sub, "gps") == 0) {
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
+      strcpy(reply, "gps not compiled in");
+      return;
+    }
+    if (!gps.detected) {
+      strcpy(reply, "gps not detected");
+      return;
+    }
+    const char* model = gpsModelName(gps);
+    if (model != NULL) {
+      dp = hwAppend(dp, end, "%s %s", model, gpsTransportName(gps));
+    } else {
+      dp = hwAppend(dp, end, "%s", gpsTransportName(gps));
+    }
+    if (gps.transport == GPS_TRANSPORT_I2C) {
+      dp = hwAppend(dp, end, " b%d 0x%02x\n", gps.bus, gps.address);
+    } else {
+      dp = hwAppend(dp, end, " rx%d tx%d @%u\n",
+                    HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin(), gps.baud);
+    }
+    // Wiring, reported raw. A -1 enable pin is itself diagnostic and is printed as -1; what it
+    // means for a given board is an open question upstream and not this command's to answer.
+    dp = hwAppend(dp, end, "en %d", gps.enable_pin);
+    if (gps.enable_pin != -1) {
+      dp = hwAppend(dp, end, " active-%s", gps.enable_active_high ? "high" : "low");
+    }
+    if (gps.shared_rail) {
+      dp = hwAppend(dp, end, " shared-rail");
+    }
+    dp = hwAppend(dp, end, ", rst %d\n", gps.reset_pin);
+    dp = hwAppend(dp, end, "%s", gps.active ? "active" : "idle");
+    LocationProvider* loc = _sensors->getLocationProvider();
+    if (loc != NULL) {
+      dp = hwAppend(dp, end, ", %s, %s, %ld sats",
+                    loc->isEnabled() ? "enabled" : "disabled",
+                    loc->isValid() ? "fix" : "no fix",
+                    loc->satellitesCount());
+    }
   } else {
-    strcpy(reply, "Usage: hwinfo [board|i2c|sensors] [start]");
+    strcpy(reply, "Usage: hwinfo [board|i2c|sensors|gps] [start]");
   }
 }
 

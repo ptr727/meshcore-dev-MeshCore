@@ -61,6 +61,8 @@ public:
   const char* getSettingValue(int i) const override;
   bool setSettingValue(const char* name, const char* value) override;
 
+  bool getGPSInfo(GPSInfo& out) const override;
+
   bool hasHardwareInventory() const override { return _i2c_scanned; }
   int  getNumDetectedDevices() const override;
   bool getDetectedDevice(int i, I2CDeviceInfo& out) const override;

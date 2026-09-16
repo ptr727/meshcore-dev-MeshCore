@@ -22,4 +22,8 @@ public:
     virtual void stop() = 0;
     virtual void loop() = 0;
     virtual bool isEnabled() = 0;
+
+    // True when this receiver's power comes from a rail shared with other peripherals, rather
+    // than a pin of its own. Reporting only, for `hwinfo`.
+    virtual bool hasSharedPowerRail() const { return false; }
 };

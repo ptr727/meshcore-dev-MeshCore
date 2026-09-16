@@ -160,8 +160,18 @@ static Adafruit_VL53L0X VL53L0X;
 static RAK12035_SoilMoisture RAK12035;
 #endif
 
+#include "GPSPins.h"   // GPS_EN / GPS_RESET and their polarity, for reporting the wiring
+
 #if ENV_INCLUDE_GPS && defined(RAK_BOARD) && !defined(RAK_WISMESH_TAG)
 #define RAK_WISBLOCK_GPS
+#endif
+
+// The baud rate Serial1.begin() is actually given, named once so the report cannot disagree
+// with the port.
+#ifdef GPS_BAUD_RATE
+#define GPS_UART_BAUD  GPS_BAUD_RATE
+#else
+#define GPS_UART_BAUD  9600
 #endif
 
 #ifdef RAK_WISBLOCK_GPS
@@ -687,6 +697,67 @@ bool EnvironmentSensorManager::begin() {
   }
 
   return true;
+}
+
+// ============================================================
+// GNSS reporting
+//
+// Three wiring models exist and they are not interchangeable:
+// a RAK12500 on I2C discovered by toggling WB_IO2/4/5, a plain
+// UART receiver, and a UART receiver with explicit reset and
+// enable pins on a power rail shared with other peripherals.
+// Facts are reported as found; none of them are interpreted.
+// ============================================================
+
+bool EnvironmentSensorManager::getGPSInfo(GPSInfo& out) const {
+#if ENV_INCLUDE_GPS
+  out.transport = GPS_TRANSPORT_NONE;
+  out.detected = gps_detected;
+  out.active = gps_active;
+  out.address = 0;
+  out.bus = 0;
+  out.enable_pin = -1;
+  out.reset_pin = -1;
+  out.enable_active_high = true;
+  out.shared_rail = false;
+  out.baud = 0;
+
+  #ifdef RAK_WISBLOCK_GPS
+  // The RAK path already knows which transport won; surface what it recorded rather than
+  // re-deriving it, and report the IO pin it settled on after probing WB_IO2/4/5.
+  //
+  // gpsResetPin starts at 0 and the serial branch only assigns it `if (PIN_GPS_EN)`, so 0 here
+  // means "no enable pin was recorded", not "pin 0". Report that as -1, the same way every other
+  // absent pin is reported -- claiming pin 0 would name a pin that is not wired to anything.
+  if (i2cGPSFlag) {
+    out.transport = GPS_TRANSPORT_I2C;
+    out.address = TELEM_RAK12500_ADDRESS;
+    out.bus = 0;               // gpsIsAwake() probes the RAK12500 on Wire specifically
+    out.enable_pin = (gpsResetPin != 0) ? (int16_t) gpsResetPin : (int16_t) -1;
+    out.enable_active_high = true;   // gpsIsAwake() wakes the module by driving the pin HIGH
+  } else if (serialGPSFlag) {
+    out.transport = GPS_TRANSPORT_UART;
+    out.baud = GPS_UART_BAUD;
+    out.enable_pin = (gpsResetPin != 0) ? (int16_t) gpsResetPin : (int16_t) -1;
+    out.enable_active_high = true;
+  }
+  #else
+  if (gps_detected) {
+    out.transport = GPS_TRANSPORT_UART;
+    out.baud = GPS_UART_BAUD;
+    out.enable_pin = (int16_t) GPS_EN;
+    out.reset_pin = (int16_t) GPS_RESET;
+    out.enable_active_high = (GPS_EN_ACTIVE == HIGH);
+    // A shared rail is the state that makes GPS behaviour confusing and that nothing reports
+    // today: another consumer holding it up keeps the receiver powered regardless of its own
+    // enable pin.
+    out.shared_rail = (_location != NULL && _location->hasSharedPowerRail());
+  }
+  #endif
+  return true;
+#else
+  return false;   // GNSS was not compiled into this build at all
+#endif
 }
 
 // ============================================================

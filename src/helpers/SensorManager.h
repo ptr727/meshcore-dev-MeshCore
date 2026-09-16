@@ -18,6 +18,28 @@ struct I2CDeviceInfo {
   uint8_t     channel;   // LPP channel if it is a telemetry sensor, 0 otherwise
 };
 
+// How a GNSS receiver is attached. Which one it is decides what the rest of GPSInfo means:
+// an I2C receiver has an address and a bus, a UART one has pins and a baud rate.
+#define GPS_TRANSPORT_NONE   0   // not compiled in, or nothing found
+#define GPS_TRANSPORT_I2C    1
+#define GPS_TRANSPORT_UART   2
+
+// What the firmware knows about the GNSS receiver it found. Wiring facts are reported as they
+// are, never interpreted -- an enable pin of -1 is reported as -1, because what that means for a
+// given board is an open question and not this command's to answer.
+struct GPSInfo {
+  uint8_t  transport;      // GPS_TRANSPORT_*
+  bool     detected;
+  bool     active;
+  uint8_t  address;        // I2C address, 0 when not on I2C
+  uint8_t  bus;            // I2C bus, when on I2C
+  int16_t  enable_pin;     // -1 when none
+  int16_t  reset_pin;      // -1 when none
+  bool     enable_active_high;
+  bool     shared_rail;    // enable is a ref-counted rail shared with other peripherals
+  uint32_t baud;           // UART only, 0 otherwise
+};
+
 class SensorManager {
 public:
   double node_lat, node_lon;  // modify these, if you want to affect Advert location
@@ -43,6 +65,10 @@ public:
   virtual bool getDetectedDevice(int i, I2CDeviceInfo& out) const { return false; }
   virtual int  getNumActiveSensors() const { return 0; }
   virtual bool getActiveSensor(int i, I2CDeviceInfo& out) const { return false; }
+
+  // GNSS wiring and detection state. False means this manager does not report GNSS at all, which
+  // is not the same as having looked and found none -- that is `detected == false`.
+  virtual bool getGPSInfo(GPSInfo& out) const { return false; }
 
   // Helper functions to manage setting by keys (useful in many places ...)
   const char* getSettingByKey(const char* key) {
