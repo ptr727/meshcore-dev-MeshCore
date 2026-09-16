@@ -1015,9 +1015,10 @@ region save
 - `{active|deactivated}, {fix|no fix}, {sat count} sats` otherwise
 
 `active` reflects the `gps` setting, i.e. whether the receiver is being polled.
-Boards with no GPS enable pin (`PIN_GPS_EN` is `-1`) cannot report the power state,
-so the reply begins with `active`/`deactivated` rather than claiming the hardware is
-on.
+A board with no GPS enable pin cannot report the power state, so the reply begins with
+`active`/`deactivated` rather than claiming the hardware is on. That covers boards
+which leave `PIN_GPS_EN` undefined as well as those defining it as `-1`; both end up
+with no usable enable pin.
 
 ---
 
