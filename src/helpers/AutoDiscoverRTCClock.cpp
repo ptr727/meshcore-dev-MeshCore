@@ -29,11 +29,13 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
 void AutoDiscoverRTCClock::begin(TwoWire& wire) {
   #if !defined(DISABLE_DS3231_PROBE)
   if (i2c_probe(wire, DS3231_ADDRESS)) {
+    MESH_DEBUG_PRINTLN("DS3231: Found");
     ds3231_success = rtc_3231.begin(&wire);
   }
   #endif
 
   if (i2c_probe(wire, RV3028_ADDRESS)) {
+    MESH_DEBUG_PRINTLN("RV3028: Found");
     rtc_rv3028.initI2C(wire);
     rtc_rv3028.writeToRegister(0x35, 0x00);
     rtc_rv3028.writeToRegister(0x37, 0xB4); // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
@@ -52,6 +54,12 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
     rtc_8130_success = true;
     MESH_DEBUG_PRINTLN("RX8130CE: Initialized");
   }
+
+  MESH_DEBUG_PRINTLN("RTC: using %s",
+    ds3231_success   ? "DS3231" :
+    rv3028_success   ? "RV3028" :
+    rtc_8563_success ? "PCF8563" :
+    rtc_8130_success ? "RX8130CE" : "none (falling back to volatile clock)");
 }
 
 uint32_t AutoDiscoverRTCClock::getCurrentTime() {
