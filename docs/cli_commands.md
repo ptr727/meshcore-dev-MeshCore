@@ -1010,6 +1010,7 @@ region save
 **Default:** `off`
 
 **Note:** Output format:
+- `not detected` when no GPS receiver was found
 - `off (enable pin low)` when the GPS enable pin is present and low
 - `{active|deactivated}, {fix|no fix}, {sat count} sats` otherwise
 
