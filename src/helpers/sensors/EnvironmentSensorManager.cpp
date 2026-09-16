@@ -863,7 +863,11 @@ bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin){
     _location = &RAK12500_provider;
     return true;
   } else if (Serial1.available()) {
-    MESH_DEBUG_PRINTLN("Serial GPS init correctly and is turned on");
+    // This only observes that bytes arrived on Serial1. Nothing here parses
+    // them, checks them for NMEA, or confirms a fix, so say that rather than
+    // reporting a successful init.
+    MESH_DEBUG_PRINTLN("Serial GPS: %d byte(s) on Serial1 with IO pin %i (not yet parsed)",
+                       Serial1.available(), ioPin);
 #ifdef PIN_GPS_EN
     if(PIN_GPS_EN){
       gpsResetPin = PIN_GPS_EN;

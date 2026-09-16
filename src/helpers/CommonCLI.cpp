@@ -393,17 +393,21 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "gps", 3) == 0) {
       LocationProvider * l = _sensors->getLocationProvider();
       if (l != NULL) {
+        // isEnabled() reports the GPS enable pin. A provider whose board has
+        // no enable pin (PIN_GPS_EN == -1) returns a constant true, so it is
+        // not a statement that the receiver is running: `active` is. Leading
+        // with it produced replies like "on, deactivated, no fix, 0 sats".
         bool enabled = l->isEnabled(); // is EN pin on ?
         bool fix = l->isValid();       // has fix ?
         int sats = l->satellitesCount();
         bool active = !strcmp(_sensors->getSettingByKey("gps"), "1");
         if (enabled) {
-          sprintf(reply, "on, %s, %s, %d sats",
+          sprintf(reply, "%s, %s, %d sats",
             active?"active":"deactivated",
             fix?"fix":"no fix",
             sats);
         } else {
-          strcpy(reply, "off");
+          strcpy(reply, "off (enable pin low)");
         }
       } else {
         strcpy(reply, "Can't find GPS");
