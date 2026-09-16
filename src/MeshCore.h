@@ -114,6 +114,19 @@ public:
     }
     return last_unique = t;
   }
+
+  // Reporting only, for `hwinfo`. Which clock is actually keeping time right now -- on a board
+  // that probes for an RTC and finds none, that is not the clock the variant nominally installed.
+  // The default is "unknown" rather than a guess, because a clock that does not answer has not
+  // been asked to.
+  virtual const char* getDriverName() const { return "unknown"; }
+
+  // I2C address the clock was found at, or 0 when it is not on I2C.
+  virtual uint8_t getDriverAddress() const { return 0; }
+
+  // True when no RTC chip was found and timekeeping fell back to another clock. False on a clock
+  // the variant installed deliberately, which is not a fallback even when it keeps time in RAM.
+  virtual bool isFallbackClock() const { return false; }
 };
 
 }

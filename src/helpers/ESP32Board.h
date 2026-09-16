@@ -213,6 +213,8 @@ public:
     settimeofday(&tv, NULL);
   }
   }
+  const char* getDriverName() const override { return "ESP32RTCClock"; }
+
   uint32_t getCurrentTime() override {
     time_t _now;
     time(&_now);

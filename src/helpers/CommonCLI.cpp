@@ -503,9 +503,20 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
                   HardwareInfo::getRadioChip());
     dp = hwAppend(dp, end, "fw %s %s\n", _callbacks->getFirmwareVer(), _callbacks->getRole());
 
-    // TODO(hwinfo): §6.2 binds rtc, §6.3 binds i2c/sensors, §6.4 binds gps state. Until then "?"
-    // marks a field nothing has reported yet -- it must never be read as "none found".
-    dp = hwAppend(dp, end, "rtc ?\n");
+    // The clock names itself. On a board that probes for an RTC and finds none, this reports the
+    // fallback that is really keeping time -- which is VolatileRTCClock on some boards and
+    // ESP32RTCClock on others, so it is never hardcoded.
+    mesh::RTCClock* rtc = getRTCClock();
+    if (rtc->isFallbackClock()) {
+      dp = hwAppend(dp, end, "rtc none (%s)\n", rtc->getDriverName());
+    } else if (rtc->getDriverAddress() != 0) {
+      dp = hwAppend(dp, end, "rtc %s @0x%02x\n", rtc->getDriverName(), rtc->getDriverAddress());
+    } else {
+      dp = hwAppend(dp, end, "rtc %s\n", rtc->getDriverName());
+    }
+
+    // TODO(hwinfo): §6.3 binds i2c/sensors, §6.4 binds gps state. Until then "?" marks a field
+    // nothing has reported yet -- it must never be read as "none found".
     if (HardwareInfo::isGPSCompiledIn()) {
       dp = hwAppend(dp, end, "gps ?\n");
     } else {
