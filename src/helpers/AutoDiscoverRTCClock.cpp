@@ -67,8 +67,12 @@ static bool rv3028_read_clock(uint32_t& unix_time) {
   uint8_t month  = bcd_to_dec(regs[5] & 0x1F);
   uint8_t year   = bcd_to_dec(regs[6]);
 
+  // A corrupt register decodes out of range rather than failing the transfer,
+  // so range-check every field. year is 0..99 because DateTime only spans
+  // 2000..2099, and a non-BCD byte such as 0xFF decodes to 165.
   if (secs > 59 || mins > 59 || hours > 23) return false;
   if (date < 1 || date > 31 || month < 1 || month > 12) return false;
+  if (year > 99) return false;
 
   unix_time = DateTime(2000 + year, month, date, hours, mins, secs).unixtime();
   return true;
@@ -126,7 +130,13 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
     uint32_t unix_time;
     if (rv3028_read_clock(unix_time)) return unix_time;
 
-    MESH_DEBUG_PRINTLN("RV3028: burst read failed, reading fields individually");
+    // getCurrentTime() is called often, and a platform whose Wire cannot issue
+    // a repeated start fails this every time, so report the fallback once.
+    static bool burst_failure_logged = false;
+    if (!burst_failure_logged) {
+      burst_failure_logged = true;
+      MESH_DEBUG_PRINTLN("RV3028: burst read failed, reading fields individually");
+    }
     return DateTime(
         rtc_rv3028.getYear(),
         rtc_rv3028.getMonth(),
