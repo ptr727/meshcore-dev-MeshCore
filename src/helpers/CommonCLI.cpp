@@ -513,6 +513,41 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     }
 }
 
+// Names whatever claimed an I2C address, and how. Shared by `hwinfo i2c` and `hwinfo all` so the
+// two cannot answer differently for the same device -- which they did, until real hardware showed
+// one reporting the RTC by name while the other called the same address unclaimed.
+//
+// Returns the claiming driver's name, or NULL when nothing claimed the address, and sets *suffix
+// to what claimed it: a telemetry channel, or the role for a device outside SENSOR_TABLE.
+const char* CommonCLI::classifyI2CDevice(const struct I2CDeviceInfo& dev, const char** suffix) {
+  static char chan[8];
+  *suffix = NULL;
+
+  if (dev.name != NULL && dev.channel != 0) {
+    snprintf(chan, sizeof(chan), "ch%u", dev.channel);
+    *suffix = chan;
+    return dev.name;
+  }
+
+  mesh::RTCClock* rtc = getRTCClock();
+  if (!rtc->isFallbackClock()
+      && rtc->getDriverAddress() == dev.address && rtc->getDriverBus() == dev.bus) {
+    *suffix = "(rtc)";
+    return rtc->getDriverName();
+  }
+
+  // The GNSS is not in SENSOR_TABLE, so without this it would read as unclaimed.
+  GPSInfo gps;
+  if (_sensors->getGPSInfo(gps) && gps.detected && gps.transport == GPS_TRANSPORT_I2C
+      && gps.address == dev.address && gps.bus == dev.bus) {
+    const char* model = gpsModelName(gps);
+    *suffix = "(gps)";
+    return (model != NULL) ? model : "unknown";
+  }
+
+  return NULL;   // answered, claimed by nobody -- the case worth surfacing
+}
+
 // Everything hwinfo knows, unpaginated, straight to the serial console -- for pasting into a bug
 // report. Printed here rather than through a CommonCLICallbacks entry the way dumpLogFile() is:
 // that callback exists because a packet log lives in firmware-specific storage, whereas every
@@ -562,8 +597,14 @@ void CommonCLI::dumpHardwareInfo() {
   {
     // Rendered with integer maths rather than %f: float formatting is a linker option on the
     // embedded C libraries this tree builds against, and nothing here needs it.
+    // The base class returns 0 for a board that does not report one; 0.000 would read as a
+    // measured value rather than as an absent one.
     float m = _board->getAdcMultiplier();
-    hwPrintLine("adc mult  : %d.%03u", (int) m, (unsigned)(fabs(m) * 1000) % 1000);
+    if (m == 0.0f) {
+      hwPrintLine("adc mult  : not reported");
+    } else {
+      hwPrintLine("adc mult  : %d.%03u", (int) m, (unsigned)(fabs(m) * 1000) % 1000);
+    }
   }
   {
     char ver[32];
@@ -601,8 +642,10 @@ void CommonCLI::dumpHardwareInfo() {
     int total = _sensors->getNumDetectedDevices();
     hwPrintLine("scan      : %d device(s)", total);
     for (int i = 0; i < total && _sensors->getDetectedDevice(i, dev); i++) {
-      if (dev.name != NULL) {
-        hwPrintLine("  bus %u 0x%02x  %s (channel %u)", dev.bus, dev.address, dev.name, dev.channel);
+      const char* suffix;
+      const char* claim = classifyI2CDevice(dev, &suffix);
+      if (claim != NULL) {
+        hwPrintLine("  bus %u 0x%02x  %s %s", dev.bus, dev.address, claim, suffix);
       } else {
         hwPrintLine("  bus %u 0x%02x  unclaimed", dev.bus, dev.address);
       }
@@ -759,25 +802,12 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
     for (i = start; i < total; i++) {
       if (!_sensors->getDetectedDevice(i, dev)) break;
       char* row = dp;
-      dp = hwAppend(dp, end, "b%d 0x%02x ", dev.bus, dev.address);
-      mesh::RTCClock* rtc = getRTCClock();
-      GPSInfo gps;
-      bool is_gps = _sensors->getGPSInfo(gps) && gps.detected
-                    && gps.transport == GPS_TRANSPORT_I2C
-                    && gps.address == dev.address && gps.bus == dev.bus;
-      if (dev.name != NULL && dev.channel != 0) {
-        dp = hwAppend(dp, end, "%s ch%d\n", dev.name, dev.channel);
-      } else if (!rtc->isFallbackClock()
-                 && rtc->getDriverAddress() == dev.address && rtc->getDriverBus() == dev.bus) {
-        dp = hwAppend(dp, end, "%s (rtc)\n", rtc->getDriverName());
-      } else if (is_gps) {
-        // The GNSS is not in SENSOR_TABLE, so without this it would read as unclaimed.
-        const char* model = gpsModelName(gps);
-        dp = hwAppend(dp, end, "%s (gps)\n", model != NULL ? model : "unknown");
+      const char* suffix;
+      const char* claim = classifyI2CDevice(dev, &suffix);
+      if (claim != NULL) {
+        dp = hwAppend(dp, end, "b%d 0x%02x %s %s\n", dev.bus, dev.address, claim, suffix);
       } else {
-        // Answered, claimed by nobody. This is the line worth having: something is on the bus
-        // and the firmware does not know what it is.
-        dp = hwAppend(dp, end, "unclaimed\n");
+        dp = hwAppend(dp, end, "b%d 0x%02x unclaimed\n", dev.bus, dev.address);
       }
       // Drop a row that leaves no room for the marker, so the page stays resumable. Never drop
       // the first row of a page: that would emit "... next:<start>" and never advance.
