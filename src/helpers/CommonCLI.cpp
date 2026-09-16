@@ -26,6 +26,11 @@ static uint32_t _atoi(const char* sp) {
 // mesh packet (MyMesh.cpp builds it inside a uint8_t[166] at offset 5).
 #define HWINFO_REPLY_MAX  160
 
+// Bytes held back for the "... next:N" continuation marker. A page that fills the buffer without
+// room for its own marker cannot be resumed, so rows are rolled back until the marker fits rather
+// than assuming a maximum row width.
+#define HWINFO_MARKER_RESERVE  14
+
 // Appends to dp within [dp, end) and returns the new write position, truncating rather than
 // overrunning. The surrounding CLI formats replies with unbounded sprintf; hwinfo does not widen
 // that pattern, because it is the one command whose output length is driven by how much hardware
@@ -515,14 +520,23 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       dp = hwAppend(dp, end, "rtc %s\n", rtc->getDriverName());
     }
 
-    // TODO(hwinfo): §6.3 binds i2c/sensors, §6.4 binds gps state. Until then "?" marks a field
-    // nothing has reported yet -- it must never be read as "none found".
+    // TODO(hwinfo): §6.4 binds gps state. Until then "?" marks a field nothing has reported yet
+    // -- it must never be read as "none found".
     if (HardwareInfo::isGPSCompiledIn()) {
       dp = hwAppend(dp, end, "gps ?\n");
     } else {
       dp = hwAppend(dp, end, "gps not compiled in\n");
     }
-    dp = hwAppend(dp, end, "i2c ? dev, ? sensor");
+
+    // A manager that never scanned a bus reports "unavailable", never "0 dev" -- claiming a bus
+    // is empty when nothing ever looked at it is the failure this command exists to prevent.
+    if (_sensors->hasHardwareInventory()) {
+      int n_sensors = _sensors->getNumActiveSensors();
+      dp = hwAppend(dp, end, "i2c %d dev, %d sensor%s",
+                    _sensors->getNumDetectedDevices(), n_sensors, n_sensors == 1 ? "" : "s");
+    } else {
+      dp = hwAppend(dp, end, "i2c/sensors unavailable");
+    }
   } else if (strcmp(sub, "board") == 0) {
     dp = hwAppend(dp, end, "%s (%s)\n",
                   _board->getManufacturerName(), HardwareInfo::getVariantSlug());
@@ -537,8 +551,87 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
     if (_board->getHardwareDetail(detail, sizeof(detail))) {
       dp = hwAppend(dp, end, "\n%s", detail);
     }
+  } else if (memcmp(sub, "i2c", 3) == 0 && (sub[3] == 0 || sub[3] == ' ')) {
+    if (!_sensors->hasHardwareInventory()) {
+      strcpy(reply, "i2c inventory unavailable on this build");
+      return;
+    }
+    int total = _sensors->getNumDetectedDevices();
+    int start = (sub[3] == ' ') ? (int) _atoi(&sub[4]) : 0;
+    if (total == 0) {
+      strcpy(reply, "i2c 0 dev");
+      return;
+    }
+    if (start >= total) {
+      strcpy(reply, "no more");
+      return;
+    }
+    I2CDeviceInfo dev;
+    dp = hwAppend(dp, end, "%d dev\n", total);
+    int i;
+    for (i = start; i < total; i++) {
+      if (!_sensors->getDetectedDevice(i, dev)) break;
+      char* row = dp;
+      dp = hwAppend(dp, end, "b%d 0x%02x ", dev.bus, dev.address);
+      mesh::RTCClock* rtc = getRTCClock();
+      if (dev.name != NULL && dev.channel != 0) {
+        dp = hwAppend(dp, end, "%s ch%d\n", dev.name, dev.channel);
+      } else if (!rtc->isFallbackClock()
+                 && rtc->getDriverAddress() == dev.address && rtc->getDriverBus() == dev.bus) {
+        dp = hwAppend(dp, end, "%s (rtc)\n", rtc->getDriverName());
+      } else {
+        // Answered, claimed by nobody. This is the line worth having: something is on the bus
+        // and the firmware does not know what it is.
+        dp = hwAppend(dp, end, "unclaimed\n");
+      }
+      // Drop a row that leaves no room for the marker, so the page stays resumable. Never drop
+      // the first row of a page: that would emit "... next:<start>" and never advance.
+      if (i > start && dp > end - HWINFO_MARKER_RESERVE) {
+        dp = row;
+        *dp = 0;
+        break;
+      }
+    }
+    if (i < total) {
+      dp = hwAppend(dp, end, "... next:%d", i);
+    } else if (dp > reply) {
+      *(dp-1) = 0;  // remove last CR
+    }
+  } else if (memcmp(sub, "sensors", 7) == 0 && (sub[7] == 0 || sub[7] == ' ')) {
+    if (!_sensors->hasHardwareInventory()) {
+      strcpy(reply, "sensors unavailable on this build");
+      return;
+    }
+    int total = _sensors->getNumActiveSensors();
+    int start = (sub[7] == ' ') ? (int) _atoi(&sub[8]) : 0;
+    if (total == 0) {
+      strcpy(reply, "0 active");
+      return;
+    }
+    if (start >= total) {
+      strcpy(reply, "no more");
+      return;
+    }
+    I2CDeviceInfo dev;
+    dp = hwAppend(dp, end, "%d active\n", total);
+    int i;
+    for (i = start; i < total; i++) {
+      if (!_sensors->getActiveSensor(i, dev)) break;
+      char* row = dp;
+      dp = hwAppend(dp, end, "ch%d %s b%d 0x%02x\n", dev.channel, dev.name, dev.bus, dev.address);
+      if (i > start && dp > end - HWINFO_MARKER_RESERVE) {
+        dp = row;
+        *dp = 0;
+        break;
+      }
+    }
+    if (i < total) {
+      dp = hwAppend(dp, end, "... next:%d", i);
+    } else if (dp > reply) {
+      *(dp-1) = 0;  // remove last CR
+    }
   } else {
-    strcpy(reply, "Usage: hwinfo [board]");
+    strcpy(reply, "Usage: hwinfo [board|i2c|sensors] [start]");
   }
 }
 

@@ -13,11 +13,20 @@ protected:
   struct ActiveSensor {
     void    (*query)(uint8_t channel, uint8_t sub_channel, CayenneLPP& telemetry);
     uint8_t   sub_channel;
+    uint8_t   table_index;   // into SENSOR_TABLE, so the name and address can be reported
   };
 
   ActiveSensor _active_sensors[MAX_ACTIVE_SENSORS];
   int          _active_sensor_count = 0;
   uint8_t      next_available_channel = TELEM_CHANNEL_SELF + 1;
+
+  // Retained boot-scan result, so `hwinfo` can answer at any time rather than only in the boot
+  // scrollback. One bit per address, snapshotted before the driver walk begins -- that walk
+  // clears bits as drivers claim them, so a bitmap kept afterwards would report a claimed device
+  // as absent. 16 bytes for the bus, plus one to record which bus it was.
+  uint8_t      _i2c_found[16] = {};
+  uint8_t      _i2c_bus = 0;
+  bool         _i2c_scanned = false;
 
   bool     gps_detected = false;
   bool     gps_active = false;
@@ -51,4 +60,10 @@ public:
   const char* getSettingName(int i) const override;
   const char* getSettingValue(int i) const override;
   bool setSettingValue(const char* name, const char* value) override;
+
+  bool hasHardwareInventory() const override { return _i2c_scanned; }
+  int  getNumDetectedDevices() const override;
+  bool getDetectedDevice(int i, I2CDeviceInfo& out) const override;
+  int  getNumActiveSensors() const override { return _active_sensor_count; }
+  bool getActiveSensor(int i, I2CDeviceInfo& out) const override;
 };

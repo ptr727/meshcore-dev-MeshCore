@@ -30,6 +30,8 @@ void AutoDiscoverRTCClock::bindDriver(Driver driver, uint8_t address) {
 }
 
 void AutoDiscoverRTCClock::begin(TwoWire& wire) {
+  _bus = (&wire == &Wire) ? 0 : 1;   // most variants probe Wire; one uses Wire1
+
   #if !defined(DISABLE_DS3231_PROBE)
   if (i2c_probe(wire, DS3231_ADDRESS)) {
     if (rtc_3231.begin(&wire)) bindDriver(DRIVER_DS3231, DS3231_ADDRESS);

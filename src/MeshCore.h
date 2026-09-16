@@ -124,6 +124,11 @@ public:
   // I2C address the clock was found at, or 0 when it is not on I2C.
   virtual uint8_t getDriverAddress() const { return 0; }
 
+  // Which I2C bus the clock was found on (0 = Wire, 1 = Wire1). The address alone does not
+  // identify a device when a board has two buses, and the clock is not always probed on the same
+  // bus the sensors are scanned on.
+  virtual uint8_t getDriverBus() const { return 0; }
+
   // True when no RTC chip was found and timekeeping fell back to another clock. False on a clock
   // the variant installed deliberately, which is not a fallback even when it keeps time in RAM.
   virtual bool isFallbackClock() const { return false; }

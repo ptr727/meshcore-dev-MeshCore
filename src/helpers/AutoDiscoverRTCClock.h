@@ -20,6 +20,7 @@ private:
   mesh::RTCClock* _fallback;
   Driver _driver = DRIVER_NONE;   // what is keeping time; NONE means the fallback is
   uint8_t _address = 0;           // address the bound chip answered at, 0 when none
+  uint8_t _bus = 0;               // bus it was probed on; 0 = Wire, 1 = Wire1
 
   bool i2c_probe(TwoWire& wire, uint8_t addr);
   void bindDriver(Driver driver, uint8_t address);
@@ -40,5 +41,6 @@ public:
   // is asked rather than assumed.
   const char* getDriverName() const override;
   uint8_t getDriverAddress() const override { return _address; }
+  uint8_t getDriverBus() const override { return _bus; }
   bool isFallbackClock() const override { return _driver == DRIVER_NONE; }
 };

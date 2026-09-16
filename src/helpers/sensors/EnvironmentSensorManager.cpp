@@ -646,6 +646,20 @@ bool EnvironmentSensorManager::begin() {
   bool detected[128] = {};
   scanI2CBus(TELEM_WIRE, detected);
 
+  // Retain the scan result for `hwinfo` before the walk below starts clearing entries as drivers
+  // claim them. Without this snapshot the inventory would report every claimed device as absent,
+  // and an address nothing claimed -- the case worth reporting -- would be indistinguishable from
+  // one that was never scanned at all.
+  for (int addr = 0; addr < 128; addr++) {
+    if (detected[addr]) _i2c_found[addr >> 3] |= (uint8_t)(1 << (addr & 7));
+  }
+  #if ENV_PIN_SDA && ENV_PIN_SCL
+  _i2c_bus = 1;   // TELEM_WIRE is Wire1 under exactly this condition
+  #else
+  _i2c_bus = 0;
+  #endif
+  _i2c_scanned = true;
+
   // Walk the sensor table and initialize only detected devices.
   _active_sensor_count = 0;
   for (size_t i = 0; i < SENSOR_TABLE_SIZE && _active_sensor_count < MAX_ACTIVE_SENSORS; i++) {
@@ -668,10 +682,70 @@ bool EnvironmentSensorManager::begin() {
     MESH_DEBUG_PRINTLN("Found %s at address: %02X", def.name, def.address);
     detected[def.address] = false;  // consumed; later entries must not re-claim this device
     for (uint8_t sub = 0; sub < n && _active_sensor_count < MAX_ACTIVE_SENSORS; sub++) {
-      _active_sensors[_active_sensor_count++] = { def.query, sub };
+      _active_sensors[_active_sensor_count++] = { def.query, sub, (uint8_t) i };
     }
   }
 
+  return true;
+}
+
+// ============================================================
+// Hardware inventory accessors
+//
+// These answer from the retained scan result rather than
+// re-probing: a scan walks 112 addresses and would stall the
+// CLI, and re-probing could also disturb a device mid-session.
+// ============================================================
+
+int EnvironmentSensorManager::getNumDetectedDevices() const {
+  int n = 0;
+  for (int i = 0; i < 16; i++) {
+    for (int bit = 0; bit < 8; bit++) {
+      if (_i2c_found[i] & (1 << bit)) n++;
+    }
+  }
+  return n;
+}
+
+bool EnvironmentSensorManager::getDetectedDevice(int i, I2CDeviceInfo& out) const {
+  if (i < 0) return false;
+
+  // Walk to the i-th address that ACKed, in ascending address order.
+  int seen = -1;
+  for (int addr = 0; addr < 128; addr++) {
+    if (!(_i2c_found[addr >> 3] & (1 << (addr & 7)))) continue;
+    if (++seen != i) continue;
+
+    out.name = NULL;       // nothing claimed it unless a driver below matches
+    out.address = (uint8_t) addr;
+    out.bus = _i2c_bus;
+    out.channel = 0;
+
+    // Which driver, if any, took this address. Reported as unclaimed otherwise -- an address
+    // that answers and that no driver recognises is precisely the case worth surfacing.
+    for (int j = 0; j < _active_sensor_count; j++) {
+      const SensorDef& def = SENSOR_TABLE[_active_sensors[j].table_index];
+      if (def.address == addr) {
+        out.name = def.name;
+        out.channel = (uint8_t)(TELEM_CHANNEL_SELF + 1 + j);
+        break;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+bool EnvironmentSensorManager::getActiveSensor(int i, I2CDeviceInfo& out) const {
+  if (i < 0 || i >= _active_sensor_count) return false;
+  const SensorDef& def = SENSOR_TABLE[_active_sensors[i].table_index];
+  out.name = def.name;
+  out.address = def.address;
+  out.bus = _i2c_bus;
+  // querySensors() hands out channels from TELEM_CHANNEL_SELF + 1 in array order, one per entry,
+  // so an entry's channel is its index. Derived rather than stored, to stay in step by
+  // construction if that allocation ever changes.
+  out.channel = (uint8_t)(TELEM_CHANNEL_SELF + 1 + i);
   return true;
 }
 
