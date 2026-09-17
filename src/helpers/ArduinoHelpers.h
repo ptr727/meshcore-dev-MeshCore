@@ -17,6 +17,8 @@ public:
     accumulator += (now - prev_millis);
     prev_millis = now;
   }
+
+  const char* getDriverName() const override { return "VolatileRTCClock"; }
 };
 
 class ArduinoMillis : public mesh::MillisecondClock {

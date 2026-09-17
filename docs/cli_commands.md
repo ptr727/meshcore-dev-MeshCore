@@ -194,6 +194,131 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 ---
 
+### Show firmware and hardware information
+**Usage:**
+- `hwinfo`
+- `hwinfo board`
+- `hwinfo i2c [start]`
+- `hwinfo sensors [start]`
+- `hwinfo gps`
+- `hwinfo all`
+
+**Parameters:**
+- `start`: index of the first entry to list, for paging through a list that does not fit one
+  reply. Defaults to `0`.
+
+**Note:** reports what the firmware is and what hardware it actually found at boot, on release
+builds. Values that were discovered at runtime are distinguished from values that were never
+looked for: a bus that was never scanned reports `unavailable`, never `0 dev`.
+
+#### `hwinfo`
+Summary, five lines:
+
+```
+rak4631 (nRF52840, SX1262)
+fw v1.17.1 repeater
+rtc RV3028 @0x52
+gps RAK12500 i2c active fix 7sat
+i2c 3 dev, 1 sensor
+```
+
+- Line 1: variant slug, MCU, LoRa transceiver. The human-readable board name is given by `board`.
+- Line 2: firmware version and role.
+- Line 3: RTC driver and I2C address, or `rtc none (<clock>)` naming the clock that is keeping
+  time instead when no RTC chip was found.
+- Line 4: GNSS model (only when the receiver was identified), transport, and state; or
+  `gps not detected`, or `gps not compiled in`.
+- Line 5: devices that answered on the scanned I2C bus and how many are active telemetry sensors;
+  or `i2c/sensors unavailable` on a build whose sensor manager never scans a bus.
+
+#### `hwinfo board`
+Board identity in full, including the fields too verbose for the summary:
+
+```
+RAK 4631 (rak4631)
+mcu nRF52840, radio SX1262
+disp SSD1306Display
+built 14 Aug 2026
+```
+
+A board with hardware the generic report cannot see adds one further line, for example
+`fem lna off` on boards with a controllable LoRa front end.
+
+#### `hwinfo i2c [start]`
+Every address that answered on the scanned bus, and which driver claimed it:
+
+```
+3 dev
+b0 0x42 RAK12500 (gps)
+b0 0x52 RV3028 (rtc)
+b0 0x76 BME680 ch2
+```
+
+`b<n>` is the I2C bus, `0` for `Wire` and `1` for `Wire1`. `ch<n>` is the telemetry channel of a
+device claimed as a sensor. An address that answered but that no driver recognised is reported as
+`unclaimed`. When the list does not fit one reply, the last line is `... next:<n>`; pass that
+number as `start` to continue.
+
+#### `hwinfo sensors [start]`
+Active telemetry sensors and the channel each reports on:
+
+```
+1 active
+ch2 BME680 b0 0x76
+```
+
+Pages the same way as `hwinfo i2c`.
+
+#### `hwinfo gps`
+GNSS transport, wiring and state:
+
+```
+RAK12500 i2c b0 0x42
+en 17 active-high, rst -1
+active, enabled, fix, 7 sats
+```
+
+For a receiver on a UART the first line is `uart rx<pin> tx<pin> @<baud>` instead. Pins are
+reported exactly as configured; `-1` means no pin is wired. `shared-rail` on the second line means
+the enable pin is a reference-counted rail shared with other peripherals, so another consumer may
+be holding the receiver powered. A receiver on a UART is not given a model name, because nothing
+identifies it.
+
+#### `hwinfo all`
+**Serial only.** Prints every field above, unpaginated, directly to the serial console for pasting
+into a bug report, and replies `   EOF` when done. Over remote admin it replies
+`hwinfo all: serial only` rather than a truncated dump.
+
+#### Other replies
+
+| Reply | Meaning |
+|---|---|
+| `i2c 0 dev` | the bus was scanned and nothing answered |
+| `0 active` | the bus was scanned and no device was claimed as a telemetry sensor |
+| `i2c inventory unavailable on this build` | this firmware's sensor manager never scans a bus, so there is nothing to report — not the same as an empty bus |
+| `sensors unavailable on this build` | as above, for `hwinfo sensors` |
+| `no more` | `start` is past the end of the list |
+| `Usage: hwinfo [board\|i2c\|sensors\|gps\|all] [start]` | unrecognised sub-command |
+
+#### Limitations
+
+`hwinfo` reports what the firmware concluded at boot. Two cases where that is less than the whole
+truth, both inherited from how detection works rather than from the reporting:
+
+- **A device name is the driver that claimed the address, not the silicon.** Several drivers share
+  an address — BME680, BME680+BSEC, BME280 and BMP280 are all probed at `0x76` (and `0x77`) — and
+  the first one whose initialisation succeeds wins. The name reported is that winner, which need
+  not be the part actually fitted. Distinguishing them would need a chip-ID register read, which
+  is a change to detection rather than to reporting.
+- **A GNSS receiver on a UART is never identified.** Detection concludes only that something is
+  sending data on the port, so no model is reported for it. Only the RAK12500 on I2C is probed by
+  name and therefore named.
+
+An address reported as `unclaimed` is exactly that: it answered, and no driver in this build
+recognised it.
+
+---
+
 ## Configuration
 
 ### Radio

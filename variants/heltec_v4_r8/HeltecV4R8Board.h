@@ -27,6 +27,7 @@ public:
   void begin();
   void attachDynamicPrefs(KeyValueStore* prefs);
   bool handleCommand(const char* command, uint32_t sender_timestamp, char* reply) override;
+  bool getHardwareDetail(char* out, size_t max_len) override;
 
   void onBeforeTransmit(void) override;
   void onAfterTransmit(void) override;

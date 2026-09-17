@@ -3,7 +3,10 @@
 #include "TxtDataHelpers.h"
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
+#include "HardwareInfo.h"
 #include <RTClib.h>
+#include <math.h>
+#include <stdarg.h>
 
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
@@ -17,6 +20,81 @@ static uint32_t _atoi(const char* sp) {
     n += (*sp++ - '0');
   }
   return n;
+}
+
+// Smallest reply buffer any caller gives us: 160 bytes on the serial CLI
+// (examples/simple_repeater/main.cpp) and 161 over remote admin, where it must also fit a single
+// mesh packet (MyMesh.cpp builds it inside a uint8_t[166] at offset 5).
+#define HWINFO_REPLY_MAX  160
+
+// Bytes held back for the "... next:N" continuation marker. A page that fills the buffer without
+// room for its own marker cannot be resumed, so rows are rolled back until the marker fits rather
+// than assuming a maximum row width.
+#define HWINFO_MARKER_RESERVE  14
+
+// Appends to dp within [dp, end) and returns the new write position, truncating rather than
+// overrunning. The surrounding CLI formats replies with unbounded sprintf; hwinfo does not widen
+// that pattern, because it is the one command whose output length is driven by how much hardware
+// a board happens to have.
+static char* hwAppend(char* dp, const char* end, const char* fmt, ...) {
+  if (dp >= end - 1) return dp;   // no room for anything but the terminator
+  size_t space = (size_t)(end - dp);   // > 1 given the guard above
+  va_list args;
+  va_start(args, fmt);
+  int n = vsnprintf(dp, space, fmt, args);
+  va_end(args);
+  if (n < 0) return dp;                               // encoding error, leave dp where it was
+  if ((size_t) n >= space) return (char *) end - 1;   // truncated; vsnprintf already terminated
+  return dp + n;
+}
+
+static const char* gpsTransportName(const GPSInfo& gps) {
+  switch (gps.transport) {
+    case GPS_TRANSPORT_I2C:  return "i2c";
+    case GPS_TRANSPORT_UART: return "uart";
+    default:                 return "unknown";
+  }
+}
+
+// Prints one line of the `hwinfo all` dump. Formats into a local buffer rather than calling
+// Serial.printf(), which is not offered by every Arduino core this tree builds against -- the
+// tree's own uses of it are all inside MESH_DEBUG, which release builds never compile. Bounding
+// each line is a second benefit; printf straight to a stream bounds nothing.
+static void hwPrintLine(const char* fmt, ...) {
+  char line[96];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  Serial.println(line);
+}
+
+// Parses a paging `start` argument into a bounded index.
+//
+// _atoi() returns uint32_t, and casting a large value straight to int wraps negative: a start of
+// 4294967295 becomes -1, which begins the loop below the first index and emits "... next:-1".
+// A client resuming from that parses "-1" back to 0, because _atoi() stops at the sign, so paging
+// never advances. Clamping to total instead makes an out-of-range start answer "no more".
+static int hwParseStart(const char* sp, int total) {
+  uint32_t value = _atoi(sp);
+  if (total < 0) return 0;
+  return (value > (uint32_t) total) ? total : (int) value;
+}
+
+// Renders a float as a fixed-point string using integer maths, because float formatting is a
+// link-time option on the embedded C libraries this tree builds against and nothing here needs it.
+//
+// The sign is taken from the value before truncation. Casting first loses it: (int)(-0.5) is 0, so
+// a temperature of -0.5 C would print as "0.5" and a sub-zero node would report as above freezing.
+// The magnitude is rounded rather than truncated, so 27.68 reads 27.7 instead of 27.6.
+static void hwFormatFixed(char* out, size_t out_len, float value, unsigned places) {
+  unsigned long scale = 1;
+  for (unsigned i = 0; i < places; i++) scale *= 10;
+  bool negative = (value < 0.0f);
+  float magnitude = negative ? -value : value;
+  unsigned long scaled = (unsigned long)(magnitude * (float) scale + 0.5f);
+  snprintf(out, out_len, "%s%lu.%0*lu",
+           negative ? "-" : "", scaled / scale, (int) places, scaled % scale);
 }
 
 static bool isValidName(const char *n) {
@@ -284,6 +362,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       sprintf(reply, "%s (Build: %s)", _callbacks->getFirmwareVer(), _callbacks->getBuildDate());
     } else if (memcmp(command, "board", 5) == 0) {
       sprintf(reply, "%s", _board->getManufacturerName());
+    } else if (memcmp(command, "hwinfo", 6) == 0 && (command[6] == 0 || command[6] == ' ')) {
+      handleHwInfoCmd(sender_timestamp, command, reply);
     } else if (memcmp(command, "sensor get ", 11) == 0) {
       const char* key = command + 11;
       const char* val = _sensors->getSettingByKey(key);
@@ -454,6 +534,410 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else {
       strcpy(reply, "Unknown command");
     }
+}
+
+// Names whatever claimed an I2C address, and how. Shared by `hwinfo i2c` and `hwinfo all` so the
+// two cannot answer differently for the same device -- which they did, until real hardware showed
+// one reporting the RTC by name while the other called the same address unclaimed.
+//
+// Returns the claiming driver's name, or NULL when nothing claimed the address, and sets *suffix
+// to what claimed it: a telemetry channel, or the role for a device outside SENSOR_TABLE.
+const char* CommonCLI::classifyI2CDevice(const struct I2CDeviceInfo& dev, const char** suffix) {
+  static char chan[8];
+  *suffix = NULL;
+
+  if (dev.name != NULL && dev.channel != 0) {
+    snprintf(chan, sizeof(chan), "ch%u", dev.channel);
+    *suffix = chan;
+    return dev.name;
+  }
+
+  mesh::RTCClock* rtc = getRTCClock();
+  if (!rtc->isFallbackClock()
+      && rtc->getDriverAddress() == dev.address && rtc->getDriverBus() == dev.bus) {
+    *suffix = "(rtc)";
+    return rtc->getDriverName();
+  }
+
+  // The GNSS is not in SENSOR_TABLE, so without this it would read as unclaimed.
+  GPSInfo gps;
+  if (_sensors->getGPSInfo(gps) && gps.detected && gps.transport == GPS_TRANSPORT_I2C
+      && gps.address == dev.address && gps.bus == dev.bus) {
+    *suffix = "(gps)";
+    return (gps.model != NULL) ? gps.model : "unknown";
+  }
+
+  return NULL;   // answered, claimed by nobody -- the case worth surfacing
+}
+
+// Everything hwinfo knows, unpaginated, straight to the serial console -- for pasting into a bug
+// report. Printed here rather than through a CommonCLICallbacks entry the way dumpLogFile() is:
+// that callback exists because a packet log lives in firmware-specific storage, whereas every
+// source here is already held by CommonCLI, so a callback would mean three example firmwares
+// carrying identical code, and a new pure virtual would break firmwares outside this tree.
+void CommonCLI::dumpHardwareInfo() {
+  hwPrintLine("--- firmware ---");
+  hwPrintLine("version   : %s", _callbacks->getFirmwareVer());
+  hwPrintLine("built     : %s", _callbacks->getBuildDate());
+  hwPrintLine("role      : %s", _callbacks->getRole());
+
+  hwPrintLine("--- board ---");
+  hwPrintLine("name      : %s", _board->getManufacturerName());
+  hwPrintLine("variant   : %s", HardwareInfo::getVariantSlug());
+  hwPrintLine("mcu       : %s (%s)", HardwareInfo::getMCUChip(), HardwareInfo::getMCUFamily());
+  hwPrintLine("radio     : %s", HardwareInfo::getRadioChip());
+  hwPrintLine("display   : %s", HardwareInfo::getDisplayName());
+  hwPrintLine("bridge    : %s", HardwareInfo::getBridgeType());
+  hwPrintLine("ethernet  : %s", HardwareInfo::hasEthernet() ? "yes" : "no");
+  {
+    char detail[48];
+    if (_board->getHardwareDetail(detail, sizeof(detail))) {
+      hwPrintLine("detail    : %s", detail);
+    }
+  }
+
+  hwPrintLine("--- power ---");
+  hwPrintLine("battery   : %u mV", _board->getBattMilliVolts());
+  hwPrintLine("ext power : %s", _board->isExternalPowered() ? "yes" : "no");
+  hwPrintLine("pwr mgt   : %s", _board->isPwrMgtInitialised() ? "initialised" : "no");
+  {
+    float t = _board->getMCUTemperature();
+    if (isnan(t)) {
+      hwPrintLine("mcu temp  : not available");
+    } else {
+      char temp[16];
+      hwFormatFixed(temp, sizeof(temp), t, 1);
+      hwPrintLine("mcu temp  : %s C", temp);
+    }
+  }
+  hwPrintLine("startup   : %u", _board->getStartupReason());
+  {
+    uint32_t reason = _board->getResetReason();
+    hwPrintLine("reset     : %u (%s)", reason, _board->getResetReasonString(reason));
+    uint8_t sd = _board->getShutdownReason();
+    hwPrintLine("shutdown  : %u (%s)", sd, _board->getShutdownReasonString(sd));
+  }
+  hwPrintLine("boot mV   : %u", _board->getBootVoltage());
+  {
+    // Rendered with integer maths rather than %f: float formatting is a linker option on the
+    // embedded C libraries this tree builds against, and nothing here needs it.
+    // The base class returns 0 for a board that does not report one; 0.000 would read as a
+    // measured value rather than as an absent one.
+    float m = _board->getAdcMultiplier();
+    if (m == 0.0f) {
+      hwPrintLine("adc mult  : not reported");
+    } else {
+      char mult[16];
+      hwFormatFixed(mult, sizeof(mult), m, 3);
+      hwPrintLine("adc mult  : %s", mult);
+    }
+  }
+  {
+    char ver[32];
+    if (_board->getBootloaderVersion(ver, sizeof(ver))) {
+      hwPrintLine("bootloader: %s", ver);
+    }
+  }
+
+  hwPrintLine("--- rtc ---");
+  {
+    mesh::RTCClock* rtc = getRTCClock();
+    hwPrintLine("driver    : %s", rtc->getDriverName());
+    if (rtc->isFallbackClock()) {
+      hwPrintLine("bound     : no chip found, using fallback");
+    } else if (rtc->getDriverAddress() != 0) {
+      hwPrintLine("bound     : bus %u, address 0x%02x",
+                  rtc->getDriverBus(), rtc->getDriverAddress());
+    } else {
+      hwPrintLine("bound     : not an I2C clock");
+    }
+    hwPrintLine("time      : %u", rtc->getCurrentTime());
+  }
+
+  hwPrintLine("--- i2c ---");
+  hwPrintLine("bus0 pins : sda %d, scl %d",
+              HardwareInfo::getI2CSdaPin(), HardwareInfo::getI2CSclPin());
+  hwPrintLine("bus1 pins : sda %d, scl %d",
+              HardwareInfo::getI2C1SdaPin(), HardwareInfo::getI2C1SclPin());
+  hwPrintLine("sensor bus: %s", HardwareInfo::sensorsOnSecondaryBus() ? "Wire1" : "Wire");
+  // Every section is printed unconditionally, and says "unavailable" when it has nothing to
+  // report. A section that disappears on some builds makes a dump pasted into a bug report
+  // ambiguous: a reader cannot tell absent hardware from an absent feature.
+  I2CDeviceInfo dev;
+  bool inventory = _sensors->hasHardwareInventory();
+  if (!inventory) {
+    // Not the same as an empty bus: this build never scanned one.
+    hwPrintLine("scan      : unavailable (no inventory on this build)");
+  } else {
+    int total = _sensors->getNumDetectedDevices();
+    hwPrintLine("scan      : %d device(s)", total);
+    for (int i = 0; i < total && _sensors->getDetectedDevice(i, dev); i++) {
+      const char* suffix;
+      const char* claim = classifyI2CDevice(dev, &suffix);
+      if (claim != NULL) {
+        hwPrintLine("  bus %u 0x%02x  %s %s", dev.bus, dev.address, claim, suffix);
+      } else {
+        hwPrintLine("  bus %u 0x%02x  unclaimed", dev.bus, dev.address);
+      }
+    }
+  }
+
+  hwPrintLine("--- sensors ---");
+  if (!inventory) {
+    hwPrintLine("active    : unavailable (no inventory on this build)");
+  } else {
+    int n = _sensors->getNumActiveSensors();
+    hwPrintLine("active    : %d", n);
+    for (int i = 0; i < n && _sensors->getActiveSensor(i, dev); i++) {
+      hwPrintLine("  channel %u  %s at bus %u 0x%02x",
+                  dev.channel, dev.name, dev.bus, dev.address);
+    }
+  }
+
+  hwPrintLine("--- gps ---");
+  {
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
+      hwPrintLine("compiled  : no");
+    } else if (!gps.detected) {
+      hwPrintLine("detected  : no");
+      hwPrintLine("pins      : rx %d, tx %d",
+                  HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin());
+    } else {
+      hwPrintLine("model     : %s", gps.model != NULL ? gps.model : "not identified");
+      hwPrintLine("transport : %s", gpsTransportName(gps));
+      if (gps.transport == GPS_TRANSPORT_I2C) {
+        hwPrintLine("i2c       : bus %u, address 0x%02x", gps.bus, gps.address);
+      } else {
+        hwPrintLine("uart      : rx %d, tx %d, %u baud",
+                    HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin(), gps.baud);
+      }
+      // Reported as wired. A -1 pin is a fact about the board, not a problem to diagnose here.
+      if (gps.enable_pin != -1) {
+        hwPrintLine("enable pin: %d (active %s)", gps.enable_pin,
+                    gps.enable_active_high ? "high" : "low");
+      } else {
+        hwPrintLine("enable pin: -1");
+      }
+      hwPrintLine("reset pin : %d", gps.reset_pin);
+      hwPrintLine("power rail: %s", gps.shared_rail ? "shared, ref-counted" : "dedicated pin");
+      hwPrintLine("state     : %s", gps.active ? "active" : "idle");
+      LocationProvider* loc = _sensors->getLocationProvider();
+      if (loc != NULL) {
+        hwPrintLine("fix       : %s, %ld satellite(s)",
+                    loc->isValid() ? "yes" : "no", loc->satellitesCount());
+        hwPrintLine("enabled   : %s", loc->isEnabled() ? "yes" : "no");
+      }
+    }
+  }
+}
+
+// Reports what the firmware is and what hardware it actually found. Everything here must work on
+// a release build: these discoveries are already made at boot, but are announced only through
+// MESH_DEBUG_PRINTLN, which a release build compiles away. See docs/cli_commands.md.
+//
+// The summary is deliberately five short lines. Both transports cap a reply at 160 bytes, and a
+// fully populated summary of the widest board in the tree measures 150, so the verbose identity
+// fields (build date, display, board-specific detail) live under `hwinfo board` instead, which
+// gets a budget of its own.
+void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* reply) {
+  const char* sub = &command[6];
+  while (*sub == ' ') sub++;
+
+  char* dp = reply;
+  const char* end = reply + HWINFO_REPLY_MAX;
+
+  if (*sub == 0) {
+    // The variant slug rather than the manufacturer name: it is the shorter and more precise of
+    // the two, and the name is already what `board` returns and what `hwinfo board` prints in
+    // full. Some board names run to 37 characters, which the 160-byte summary cannot afford.
+    dp = hwAppend(dp, end, "%s (%s, %s)\n",
+                  HardwareInfo::getVariantSlug(),
+                  HardwareInfo::getMCUChip(),
+                  HardwareInfo::getRadioChip());
+    dp = hwAppend(dp, end, "fw %s %s\n", _callbacks->getFirmwareVer(), _callbacks->getRole());
+
+    // The clock names itself. On a board that probes for an RTC and finds none, this reports the
+    // fallback that is really keeping time -- which is VolatileRTCClock on some boards and
+    // ESP32RTCClock on others, so it is never hardcoded.
+    mesh::RTCClock* rtc = getRTCClock();
+    if (rtc->isFallbackClock()) {
+      dp = hwAppend(dp, end, "rtc none (%s)\n", rtc->getDriverName());
+    } else if (rtc->getDriverAddress() != 0) {
+      dp = hwAppend(dp, end, "rtc %s @0x%02x\n", rtc->getDriverName(), rtc->getDriverAddress());
+    } else {
+      dp = hwAppend(dp, end, "rtc %s\n", rtc->getDriverName());
+    }
+
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
+      dp = hwAppend(dp, end, "gps not compiled in\n");
+    } else if (!gps.detected) {
+      dp = hwAppend(dp, end, "gps not detected\n");
+    } else {
+      if (gps.model != NULL) {
+        dp = hwAppend(dp, end, "gps %s %s", gps.model, gpsTransportName(gps));
+      } else {
+        dp = hwAppend(dp, end, "gps %s", gpsTransportName(gps));
+      }
+      dp = hwAppend(dp, end, " %s", gps.active ? "active" : "idle");
+      // Fix and satellite count come from the provider, which is the only thing that knows.
+      LocationProvider* loc = _sensors->getLocationProvider();
+      if (loc != NULL) {
+        dp = hwAppend(dp, end, " %s %ldsat", loc->isValid() ? "fix" : "nofix",
+                      loc->satellitesCount());
+      }
+      dp = hwAppend(dp, end, "\n");
+    }
+
+    // A manager that never scanned a bus reports "unavailable", never "0 dev" -- claiming a bus
+    // is empty when nothing ever looked at it is the failure this command exists to prevent.
+    if (_sensors->hasHardwareInventory()) {
+      int n_sensors = _sensors->getNumActiveSensors();
+      dp = hwAppend(dp, end, "i2c %d dev, %d sensor%s",
+                    _sensors->getNumDetectedDevices(), n_sensors, n_sensors == 1 ? "" : "s");
+    } else {
+      dp = hwAppend(dp, end, "i2c/sensors unavailable");
+    }
+  } else if (strcmp(sub, "board") == 0) {
+    dp = hwAppend(dp, end, "%s (%s)\n",
+                  _board->getManufacturerName(), HardwareInfo::getVariantSlug());
+    dp = hwAppend(dp, end, "mcu %s, radio %s\n",
+                  HardwareInfo::getMCUChip(), HardwareInfo::getRadioChip());
+    dp = hwAppend(dp, end, "disp %s\n", HardwareInfo::getDisplayName());
+    dp = hwAppend(dp, end, "built %s", _callbacks->getBuildDate());
+
+    // A board with hardware the generic report cannot see appends it here. Boards that override
+    // nothing contribute nothing, which is every board bar those with a controllable front end.
+    char detail[48];
+    if (_board->getHardwareDetail(detail, sizeof(detail))) {
+      dp = hwAppend(dp, end, "\n%s", detail);
+    }
+  } else if (memcmp(sub, "i2c", 3) == 0 && (sub[3] == 0 || sub[3] == ' ')) {
+    if (!_sensors->hasHardwareInventory()) {
+      strcpy(reply, "i2c inventory unavailable on this build");
+      return;
+    }
+    int total = _sensors->getNumDetectedDevices();
+    int start = (sub[3] == ' ') ? hwParseStart(&sub[4], total) : 0;
+    if (total == 0) {
+      strcpy(reply, "i2c 0 dev");
+      return;
+    }
+    if (start >= total) {
+      strcpy(reply, "no more");
+      return;
+    }
+    I2CDeviceInfo dev;
+    dp = hwAppend(dp, end, "%d dev\n", total);
+    int i;
+    for (i = start; i < total; i++) {
+      if (!_sensors->getDetectedDevice(i, dev)) break;
+      char* row = dp;
+      const char* suffix;
+      const char* claim = classifyI2CDevice(dev, &suffix);
+      if (claim != NULL) {
+        dp = hwAppend(dp, end, "b%d 0x%02x %s %s\n", dev.bus, dev.address, claim, suffix);
+      } else {
+        dp = hwAppend(dp, end, "b%d 0x%02x unclaimed\n", dev.bus, dev.address);
+      }
+      // Drop a row that leaves no room for the marker, so the page stays resumable. Never drop
+      // the first row of a page: that would emit "... next:<start>" and never advance.
+      if (i > start && dp > end - HWINFO_MARKER_RESERVE) {
+        dp = row;
+        *dp = 0;
+        break;
+      }
+    }
+    if (i < total) {
+      dp = hwAppend(dp, end, "... next:%d", i);
+    } else if (dp > reply) {
+      *(dp-1) = 0;  // remove last CR
+    }
+  } else if (memcmp(sub, "sensors", 7) == 0 && (sub[7] == 0 || sub[7] == ' ')) {
+    if (!_sensors->hasHardwareInventory()) {
+      strcpy(reply, "sensors unavailable on this build");
+      return;
+    }
+    int total = _sensors->getNumActiveSensors();
+    int start = (sub[7] == ' ') ? hwParseStart(&sub[8], total) : 0;
+    if (total == 0) {
+      strcpy(reply, "0 active");
+      return;
+    }
+    if (start >= total) {
+      strcpy(reply, "no more");
+      return;
+    }
+    I2CDeviceInfo dev;
+    dp = hwAppend(dp, end, "%d active\n", total);
+    int i;
+    for (i = start; i < total; i++) {
+      if (!_sensors->getActiveSensor(i, dev)) break;
+      char* row = dp;
+      dp = hwAppend(dp, end, "ch%d %s b%d 0x%02x\n", dev.channel, dev.name, dev.bus, dev.address);
+      if (i > start && dp > end - HWINFO_MARKER_RESERVE) {
+        dp = row;
+        *dp = 0;
+        break;
+      }
+    }
+    if (i < total) {
+      dp = hwAppend(dp, end, "... next:%d", i);
+    } else if (dp > reply) {
+      *(dp-1) = 0;  // remove last CR
+    }
+  } else if (strcmp(sub, "gps") == 0) {
+    GPSInfo gps;
+    if (!_sensors->getGPSInfo(gps)) {
+      strcpy(reply, "gps not compiled in");
+      return;
+    }
+    if (!gps.detected) {
+      strcpy(reply, "gps not detected");
+      return;
+    }
+    if (gps.model != NULL) {
+      dp = hwAppend(dp, end, "%s %s", gps.model, gpsTransportName(gps));
+    } else {
+      dp = hwAppend(dp, end, "%s", gpsTransportName(gps));
+    }
+    if (gps.transport == GPS_TRANSPORT_I2C) {
+      dp = hwAppend(dp, end, " b%d 0x%02x\n", gps.bus, gps.address);
+    } else {
+      dp = hwAppend(dp, end, " rx%d tx%d @%u\n",
+                    HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin(), gps.baud);
+    }
+    // Wiring, reported raw. A -1 enable pin is itself diagnostic and is printed as -1; what it
+    // means for a given board is an open question upstream and not this command's to answer.
+    dp = hwAppend(dp, end, "en %d", gps.enable_pin);
+    if (gps.enable_pin != -1) {
+      dp = hwAppend(dp, end, " active-%s", gps.enable_active_high ? "high" : "low");
+    }
+    if (gps.shared_rail) {
+      dp = hwAppend(dp, end, " shared-rail");
+    }
+    dp = hwAppend(dp, end, ", rst %d\n", gps.reset_pin);
+    dp = hwAppend(dp, end, "%s", gps.active ? "active" : "idle");
+    LocationProvider* loc = _sensors->getLocationProvider();
+    if (loc != NULL) {
+      dp = hwAppend(dp, end, ", %s, %s, %ld sats",
+                    loc->isEnabled() ? "enabled" : "disabled",
+                    loc->isValid() ? "fix" : "no fix",
+                    loc->satellitesCount());
+    }
+  } else if (strcmp(sub, "all") == 0) {
+    // Serial only, like `log` and the `stats-*` commands: the dump is many lines and would be
+    // truncated to nonsense inside a single mesh packet.
+    if (sender_timestamp != 0) {
+      strcpy(reply, "hwinfo all: serial only");
+      return;
+    }
+    dumpHardwareInfo();
+    strcpy(reply, "   EOF");
+  } else {
+    strcpy(reply, "Usage: hwinfo [board|i2c|sensors|gps|all] [start]");
+  }
 }
 
 void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {

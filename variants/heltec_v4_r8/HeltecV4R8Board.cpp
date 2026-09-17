@@ -142,3 +142,13 @@ bool HeltecV4R8Board::handleCommand(const char* command, uint32_t sender_timesta
 
   return false; // not handled
 }
+
+// This board's LoRa front end is controllable, and nothing in the generic hwinfo report can know
+// that: the FEM API is board-private and answered through handleCommand. Report presence and the
+// current LNA state, and nothing else -- hwinfo reports facts, it does not interpret them.
+bool HeltecV4R8Board::getHardwareDetail(char* out, size_t max_len) {
+  snprintf(out, max_len, "fem lna %s",
+           !loRaFEMControl.isLnaCanControl() ? "unsupported"
+                                             : (isLoRaFemLnaEnabled() ? "on" : "off"));
+  return true;
+}

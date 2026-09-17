@@ -4,38 +4,7 @@
 #include <MicroNMEA.h>
 #include <RTClib.h>
 #include <helpers/RefCountedDigitalPin.h>
-
-#ifndef GPS_EN
-    #ifdef PIN_GPS_EN
-        #define GPS_EN PIN_GPS_EN
-    #else
-        #define GPS_EN (-1)
-    #endif
-#endif
-
-#ifndef GPS_EN_ACTIVE
-    #ifdef PIN_GPS_EN_ACTIVE
-        #define GPS_EN_ACTIVE PIN_GPS_EN_ACTIVE
-    #else
-        #define GPS_EN_ACTIVE HIGH
-    #endif
-#endif
-
-#ifndef GPS_RESET
-    #ifdef PIN_GPS_RESET
-        #define GPS_RESET PIN_GPS_RESET
-    #else
-        #define GPS_RESET (-1)
-    #endif
-#endif
-
-#ifndef GPS_RESET_ACTIVE
-    #ifdef PIN_GPS_RESET_ACTIVE
-        #define GPS_RESET_ACTIVE PIN_GPS_RESET_ACTIVE
-    #else
-        #define GPS_RESET_ACTIVE LOW
-    #endif
-#endif
+#include "GPSPins.h"
 
 class MicroNMEALocationProvider : public LocationProvider {
     char _nmeaBuffer[100];
@@ -63,6 +32,8 @@ public :
             digitalWrite(_pin_en, !GPS_EN_ACTIVE);
         }
     }
+
+    bool hasSharedPowerRail() const override { return _peripher_power != NULL; }
 
     void claim() {
         _claims++;

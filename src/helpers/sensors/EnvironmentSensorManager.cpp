@@ -160,8 +160,18 @@ static Adafruit_VL53L0X VL53L0X;
 static RAK12035_SoilMoisture RAK12035;
 #endif
 
+#include "GPSPins.h"   // GPS_EN / GPS_RESET and their polarity, for reporting the wiring
+
 #if ENV_INCLUDE_GPS && defined(RAK_BOARD) && !defined(RAK_WISMESH_TAG)
 #define RAK_WISBLOCK_GPS
+#endif
+
+// The baud rate Serial1.begin() is actually given, named once so the report cannot disagree
+// with the port.
+#ifdef GPS_BAUD_RATE
+#define GPS_UART_BAUD  GPS_BAUD_RATE
+#else
+#define GPS_UART_BAUD  9600
 #endif
 
 #ifdef RAK_WISBLOCK_GPS
@@ -646,6 +656,20 @@ bool EnvironmentSensorManager::begin() {
   bool detected[128] = {};
   scanI2CBus(TELEM_WIRE, detected);
 
+  // Retain the scan result for `hwinfo` before the walk below starts clearing entries as drivers
+  // claim them. Without this snapshot the inventory would report every claimed device as absent,
+  // and an address nothing claimed -- the case worth reporting -- would be indistinguishable from
+  // one that was never scanned at all.
+  for (int addr = 0; addr < 128; addr++) {
+    if (detected[addr]) _i2c_found[addr >> 3] |= (uint8_t)(1 << (addr & 7));
+  }
+  #if ENV_PIN_SDA && ENV_PIN_SCL
+  _i2c_bus = 1;   // TELEM_WIRE is Wire1 under exactly this condition
+  #else
+  _i2c_bus = 0;
+  #endif
+  _i2c_scanned = true;
+
   // Walk the sensor table and initialize only detected devices.
   _active_sensor_count = 0;
   for (size_t i = 0; i < SENSOR_TABLE_SIZE && _active_sensor_count < MAX_ACTIVE_SENSORS; i++) {
@@ -668,10 +692,135 @@ bool EnvironmentSensorManager::begin() {
     MESH_DEBUG_PRINTLN("Found %s at address: %02X", def.name, def.address);
     detected[def.address] = false;  // consumed; later entries must not re-claim this device
     for (uint8_t sub = 0; sub < n && _active_sensor_count < MAX_ACTIVE_SENSORS; sub++) {
-      _active_sensors[_active_sensor_count++] = { def.query, sub };
+      _active_sensors[_active_sensor_count++] = { def.query, sub, (uint8_t) i };
     }
   }
 
+  return true;
+}
+
+// ============================================================
+// GNSS reporting
+//
+// Three wiring models exist and they are not interchangeable:
+// a RAK12500 on I2C discovered by toggling WB_IO2/4/5, a plain
+// UART receiver, and a UART receiver with explicit reset and
+// enable pins on a power rail shared with other peripherals.
+// Facts are reported as found; none of them are interpreted.
+// ============================================================
+
+bool EnvironmentSensorManager::getGPSInfo(GPSInfo& out) const {
+#if ENV_INCLUDE_GPS
+  out.model = NULL;
+  out.transport = GPS_TRANSPORT_NONE;
+  out.detected = gps_detected;
+  out.active = gps_active;
+  out.address = 0;
+  out.bus = 0;
+  out.enable_pin = -1;
+  out.reset_pin = -1;
+  out.enable_active_high = true;
+  out.shared_rail = false;
+  out.baud = 0;
+
+  #ifdef RAK_WISBLOCK_GPS
+  // The RAK path already knows which transport won; surface what it recorded rather than
+  // re-deriving it, and report the IO pin it settled on after probing WB_IO2/4/5.
+  //
+  // gpsResetPin starts at 0 and the serial branch only assigns it `if (PIN_GPS_EN)`, so 0 here
+  // means "no enable pin was recorded", not "pin 0". Report that as -1, the same way every other
+  // absent pin is reported -- claiming pin 0 would name a pin that is not wired to anything.
+  if (i2cGPSFlag) {
+    // Named here rather than in the CLI: this is the branch that probed a u-blox RAK12500 by
+    // name and got an answer, so this is the only place that actually knows what it is.
+    out.model = "RAK12500";
+    out.transport = GPS_TRANSPORT_I2C;
+    out.address = TELEM_RAK12500_ADDRESS;
+    out.bus = 0;               // gpsIsAwake() probes the RAK12500 on Wire specifically
+    out.enable_pin = (gpsResetPin != 0) ? (int16_t) gpsResetPin : (int16_t) -1;
+    out.enable_active_high = true;   // gpsIsAwake() wakes the module by driving the pin HIGH
+  } else if (serialGPSFlag) {
+    out.transport = GPS_TRANSPORT_UART;
+    out.baud = GPS_UART_BAUD;
+    out.enable_pin = (gpsResetPin != 0) ? (int16_t) gpsResetPin : (int16_t) -1;
+    out.enable_active_high = true;
+  }
+  #else
+  if (gps_detected) {
+    out.transport = GPS_TRANSPORT_UART;
+    out.baud = GPS_UART_BAUD;
+    out.enable_pin = (int16_t) GPS_EN;
+    out.reset_pin = (int16_t) GPS_RESET;
+    out.enable_active_high = (GPS_EN_ACTIVE == HIGH);
+    // A shared rail is the state that makes GPS behaviour confusing and that nothing reports
+    // today: another consumer holding it up keeps the receiver powered regardless of its own
+    // enable pin.
+    out.shared_rail = (_location != NULL && _location->hasSharedPowerRail());
+  }
+  #endif
+  return true;
+#else
+  return false;   // GNSS was not compiled into this build at all
+#endif
+}
+
+// ============================================================
+// Hardware inventory accessors
+//
+// These answer from the retained scan result rather than
+// re-probing: a scan walks 112 addresses and would stall the
+// CLI, and re-probing could also disturb a device mid-session.
+// ============================================================
+
+int EnvironmentSensorManager::getNumDetectedDevices() const {
+  int n = 0;
+  for (int i = 0; i < 16; i++) {
+    for (int bit = 0; bit < 8; bit++) {
+      if (_i2c_found[i] & (1 << bit)) n++;
+    }
+  }
+  return n;
+}
+
+bool EnvironmentSensorManager::getDetectedDevice(int i, I2CDeviceInfo& out) const {
+  if (i < 0) return false;
+
+  // Walk to the i-th address that ACKed, in ascending address order.
+  int seen = -1;
+  for (int addr = 0; addr < 128; addr++) {
+    if (!(_i2c_found[addr >> 3] & (1 << (addr & 7)))) continue;
+    if (++seen != i) continue;
+
+    out.name = NULL;       // nothing claimed it unless a driver below matches
+    out.address = (uint8_t) addr;
+    out.bus = _i2c_bus;
+    out.channel = 0;
+
+    // Which driver, if any, took this address. Reported as unclaimed otherwise -- an address
+    // that answers and that no driver recognises is precisely the case worth surfacing.
+    for (int j = 0; j < _active_sensor_count; j++) {
+      const SensorDef& def = SENSOR_TABLE[_active_sensors[j].table_index];
+      if (def.address == addr) {
+        out.name = def.name;
+        out.channel = (uint8_t)(TELEM_CHANNEL_SELF + 1 + j);
+        break;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+bool EnvironmentSensorManager::getActiveSensor(int i, I2CDeviceInfo& out) const {
+  if (i < 0 || i >= _active_sensor_count) return false;
+  const SensorDef& def = SENSOR_TABLE[_active_sensors[i].table_index];
+  out.name = def.name;
+  out.address = def.address;
+  out.bus = _i2c_bus;
+  // querySensors() hands out channels from TELEM_CHANNEL_SELF + 1 in array order, one per entry,
+  // so an entry's channel is its index. Derived rather than stored, to stay in step by
+  // construction if that allocation ever changes.
+  out.channel = (uint8_t)(TELEM_CHANNEL_SELF + 1 + i);
   return true;
 }
 
