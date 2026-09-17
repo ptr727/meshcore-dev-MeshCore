@@ -628,11 +628,15 @@ void CommonCLI::dumpHardwareInfo() {
   hwPrintLine("bus1 pins : sda %d, scl %d",
               HardwareInfo::getI2C1SdaPin(), HardwareInfo::getI2C1SclPin());
   hwPrintLine("sensor bus: %s", HardwareInfo::sensorsOnSecondaryBus() ? "Wire1" : "Wire");
-  if (!_sensors->hasHardwareInventory()) {
+  // Every section is printed unconditionally, and says "unavailable" when it has nothing to
+  // report. A section that disappears on some builds makes a dump pasted into a bug report
+  // ambiguous: a reader cannot tell absent hardware from an absent feature.
+  I2CDeviceInfo dev;
+  bool inventory = _sensors->hasHardwareInventory();
+  if (!inventory) {
     // Not the same as an empty bus: this build never scanned one.
     hwPrintLine("scan      : unavailable (no inventory on this build)");
   } else {
-    I2CDeviceInfo dev;
     int total = _sensors->getNumDetectedDevices();
     hwPrintLine("scan      : %d device(s)", total);
     for (int i = 0; i < total && _sensors->getDetectedDevice(i, dev); i++) {
@@ -644,8 +648,12 @@ void CommonCLI::dumpHardwareInfo() {
         hwPrintLine("  bus %u 0x%02x  unclaimed", dev.bus, dev.address);
       }
     }
+  }
 
-    hwPrintLine("--- sensors ---");
+  hwPrintLine("--- sensors ---");
+  if (!inventory) {
+    hwPrintLine("active    : unavailable (no inventory on this build)");
+  } else {
     int n = _sensors->getNumActiveSensors();
     hwPrintLine("active    : %d", n);
     for (int i = 0; i < n && _sensors->getActiveSensor(i, dev); i++) {
