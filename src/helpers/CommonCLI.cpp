@@ -350,18 +350,23 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
             end = i;
             break;
           }
+          size_t space = (size_t)(lim - dp);
+          // A row with further rows behind it has to leave room for the continuation marker, so a
+          // page is never emitted without the marker that makes it resumable -- including the
+          // first row of a page, which is written truncated into what is left rather than skipped.
+          size_t avail = (i + 1 < end && space > CLI_MARKER_RESERVE) ? space - CLI_MARKER_RESERVE
+                                                                     : space;
           size_t row_len = strlen(name) + strlen(value) + 2;  // "name" "=" "value" "\n"
-          // Stop before a row that would leave no room for the continuation marker, so the page
-          // stays resumable. Never stop on the first row of a page: that emits "... next:<start>"
-          // and never advances, so an over-long first row is truncated into the buffer instead.
-          if (i > start && row_len + CLI_MARKER_RESERVE >= (size_t)(lim - dp)) break;
-          snprintf(dp, (size_t)(lim - dp), "%s=%s\n", name, value);
+          // Stop before a row that does not fit, but never on the first row of a page: that emits
+          // "... next:<start>" and never advances.
+          if (row_len >= avail && i > start) break;
+          snprintf(dp, avail, "%s=%s\n", name, value);
           dp = strchr(dp, 0);
         }
         if (i < end) {
           snprintf(dp, (size_t)(lim - dp), "... next:%d", i);
-        } else if (dp > reply) {
-          *(dp-1) = 0; // remove last CR
+        } else if (dp > reply && *(dp-1) == '\n') {
+          *(dp-1) = 0; // remove last CR, when the final row was not truncated out of one
         }
       }
     } else if (memcmp(command, "region", 6) == 0) {
