@@ -36,10 +36,21 @@ static uint32_t _atoi(const char* sp) {
 // of 4294967295 becomes -1, which begins a listing loop below the first index and reaches the
 // accessors with a negative index. Clamping to total instead makes an out-of-range start answer
 // through the ordinary "nothing more to list" path.
+//
+// The clamp is applied while parsing rather than to _atoi()'s result, because _atoi() wraps its
+// own uint32_t on a long enough digit string: 4294967296 comes back as 0, which would list from
+// the first index instead of answering that there is nothing there.
 static int parseStartIndex(const char* sp, int total) {
-  uint32_t value = _atoi(sp);
-  if (total < 0) return 0;
-  return (value > (uint32_t) total) ? total : (int) value;
+  if (total <= 0) return 0;
+  uint32_t limit = (uint32_t) total;
+  uint32_t value = 0;
+  while (*sp >= '0' && *sp <= '9') {
+    uint32_t digit = (uint32_t)(*sp++ - '0');
+    // value * 10 + digit > limit, written so that neither side can overflow.
+    if (value > limit / 10 || (value == limit / 10 && digit > limit % 10)) return total;
+    value = value * 10 + digit;
+  }
+  return (int) value;
 }
 
 static bool isValidName(const char *n) {
