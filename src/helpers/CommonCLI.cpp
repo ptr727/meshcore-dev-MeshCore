@@ -19,11 +19,14 @@ static uint32_t _atoi(const char* sp) {
   return n;
 }
 
-// Smallest reply buffer any caller hands handleCommand(): 160 bytes on the serial CLI
-// (examples/simple_repeater/main.cpp) and 161 over remote admin, where the reply is built inside
-// a uint8_t[166] at offset 5 (MyMesh.cpp). The paging loop below has to bound itself against the
-// smaller of the two, because it cannot see either one.
-#define CLI_REPLY_MAX  160
+// Smallest reply buffer any caller hands handleCommand(). The serial CLI passes a char[160]
+// (examples/simple_repeater/main.cpp) and remote admin passes 161, the tail of a uint8_t[166] at
+// offset 5 (MyMesh.cpp). Every wrapper that reaches here -- simple_repeater, simple_room_server
+// and simple_sensor -- first reflects an optional 3-byte "xx|" companion-radio prefix back into
+// the reply and advances the pointer past it, so what this function receives can be 3 bytes
+// shorter than either. The paging loop below has to bound itself against the smallest of those,
+// because it can see neither the buffer nor whether a prefix was consumed.
+#define CLI_REPLY_MAX  157
 
 // Bytes held back for a "... next:N" continuation marker: 9 for the text, up to 10 for the index
 // and 1 for the terminator. A page that fills the buffer without room for its own marker cannot
