@@ -711,6 +711,7 @@ bool EnvironmentSensorManager::begin() {
 
 bool EnvironmentSensorManager::getGPSInfo(GPSInfo& out) const {
 #if ENV_INCLUDE_GPS
+  out.model = NULL;
   out.transport = GPS_TRANSPORT_NONE;
   out.detected = gps_detected;
   out.active = gps_active;
@@ -730,6 +731,9 @@ bool EnvironmentSensorManager::getGPSInfo(GPSInfo& out) const {
   // means "no enable pin was recorded", not "pin 0". Report that as -1, the same way every other
   // absent pin is reported -- claiming pin 0 would name a pin that is not wired to anything.
   if (i2cGPSFlag) {
+    // Named here rather than in the CLI: this is the branch that probed a u-blox RAK12500 by
+    // name and got an answer, so this is the only place that actually knows what it is.
+    out.model = "RAK12500";
     out.transport = GPS_TRANSPORT_I2C;
     out.address = TELEM_RAK12500_ADDRESS;
     out.bus = 0;               // gpsIsAwake() probes the RAK12500 on Wire specifically

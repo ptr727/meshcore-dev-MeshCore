@@ -5,6 +5,7 @@
 #include "TxtDataHelpers.h"
 #include "HardwareInfo.h"
 #include <RTClib.h>
+#include <math.h>
 #include <stdarg.h>
 
 #ifndef BRIDGE_MAX_BAUD
@@ -37,20 +38,14 @@ static uint32_t _atoi(const char* sp) {
 // a board happens to have.
 static char* hwAppend(char* dp, const char* end, const char* fmt, ...) {
   if (dp >= end - 1) return dp;   // no room for anything but the terminator
+  size_t space = (size_t)(end - dp);   // > 1 given the guard above
   va_list args;
   va_start(args, fmt);
-  int n = vsnprintf(dp, end - dp, fmt, args);
+  int n = vsnprintf(dp, space, fmt, args);
   va_end(args);
-  if (n < 0) return dp;                            // encoding error, leave dp where it was
-  if (n >= end - dp) return (char *) end - 1;      // truncated; vsnprintf already terminated
+  if (n < 0) return dp;                               // encoding error, leave dp where it was
+  if ((size_t) n >= space) return (char *) end - 1;   // truncated; vsnprintf already terminated
   return dp + n;
-}
-
-// A GNSS receiver's model is only known where the driver identified it. The RAK12500 is probed
-// by name on I2C, so it can be stated; a UART receiver is never identified -- MeshCore reads NMEA
-// without asking what is sending it -- so NULL is returned and nothing is claimed about it.
-static const char* gpsModelName(const GPSInfo& gps) {
-  return (gps.transport == GPS_TRANSPORT_I2C && gps.address == 0x42) ? "RAK12500" : NULL;
 }
 
 static const char* gpsTransportName(const GPSInfo& gps) {
@@ -540,9 +535,8 @@ const char* CommonCLI::classifyI2CDevice(const struct I2CDeviceInfo& dev, const 
   GPSInfo gps;
   if (_sensors->getGPSInfo(gps) && gps.detected && gps.transport == GPS_TRANSPORT_I2C
       && gps.address == dev.address && gps.bus == dev.bus) {
-    const char* model = gpsModelName(gps);
     *suffix = "(gps)";
-    return (model != NULL) ? model : "unknown";
+    return (gps.model != NULL) ? gps.model : "unknown";
   }
 
   return NULL;   // answered, claimed by nobody -- the case worth surfacing
@@ -670,8 +664,7 @@ void CommonCLI::dumpHardwareInfo() {
       hwPrintLine("pins      : rx %d, tx %d",
                   HardwareInfo::getGPSRxPin(), HardwareInfo::getGPSTxPin());
     } else {
-      const char* model = gpsModelName(gps);
-      hwPrintLine("model     : %s", model != NULL ? model : "not identified");
+      hwPrintLine("model     : %s", gps.model != NULL ? gps.model : "not identified");
       hwPrintLine("transport : %s", gpsTransportName(gps));
       if (gps.transport == GPS_TRANSPORT_I2C) {
         hwPrintLine("i2c       : bus %u, address 0x%02x", gps.bus, gps.address);
@@ -742,9 +735,8 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
     } else if (!gps.detected) {
       dp = hwAppend(dp, end, "gps not detected\n");
     } else {
-      const char* model = gpsModelName(gps);
-      if (model != NULL) {
-        dp = hwAppend(dp, end, "gps %s %s", model, gpsTransportName(gps));
+      if (gps.model != NULL) {
+        dp = hwAppend(dp, end, "gps %s %s", gps.model, gpsTransportName(gps));
       } else {
         dp = hwAppend(dp, end, "gps %s", gpsTransportName(gps));
       }
@@ -865,9 +857,8 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       strcpy(reply, "gps not detected");
       return;
     }
-    const char* model = gpsModelName(gps);
-    if (model != NULL) {
-      dp = hwAppend(dp, end, "%s %s", model, gpsTransportName(gps));
+    if (gps.model != NULL) {
+      dp = hwAppend(dp, end, "%s %s", gps.model, gpsTransportName(gps));
     } else {
       dp = hwAppend(dp, end, "%s", gpsTransportName(gps));
     }

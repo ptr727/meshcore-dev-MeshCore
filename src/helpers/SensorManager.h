@@ -28,6 +28,10 @@ struct I2CDeviceInfo {
 // are, never interpreted -- an enable pin of -1 is reported as -1, because what that means for a
 // given board is an open question and not this command's to answer.
 struct GPSInfo {
+  // Model, only where the driver identified the receiver by name -- NULL otherwise, and never
+  // inferred from the address it answered at. A receiver on a UART is never identified, because
+  // detection concludes only that something is sending data on the port.
+  const char* model;
   uint8_t  transport;      // GPS_TRANSPORT_*
   bool     detected;
   bool     active;
