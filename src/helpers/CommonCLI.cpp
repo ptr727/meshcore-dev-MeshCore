@@ -19,6 +19,29 @@ static uint32_t _atoi(const char* sp) {
   return n;
 }
 
+// Smallest reply buffer any caller hands handleCommand(): 160 bytes on the serial CLI
+// (examples/simple_repeater/main.cpp) and 161 over remote admin, where the reply is built inside
+// a uint8_t[166] at offset 5 (MyMesh.cpp). The paging loop below has to bound itself against the
+// smaller of the two, because it cannot see either one.
+#define CLI_REPLY_MAX  160
+
+// Bytes held back for a "... next:N" continuation marker: 9 for the text, up to 10 for the index
+// and 1 for the terminator. A page that fills the buffer without room for its own marker cannot
+// be resumed.
+#define CLI_MARKER_RESERVE  20
+
+// Parses a paging `start` argument into a bounded index.
+//
+// _atoi() returns uint32_t, and assigning a large value straight to an int wraps negative: a start
+// of 4294967295 becomes -1, which begins a listing loop below the first index and reaches the
+// accessors with a negative index. Clamping to total instead makes an out-of-range start answer
+// through the ordinary "nothing more to list" path.
+static int parseStartIndex(const char* sp, int total) {
+  uint32_t value = _atoi(sp);
+  if (total < 0) return 0;
+  return (value > (uint32_t) total) ? total : (int) value;
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -305,26 +328,39 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       }
     } else if (memcmp(command, "sensor list", 11) == 0) {
       char* dp = reply;
+      const char* lim = reply + CLI_REPLY_MAX;
       int start = 0;
       int end = _sensors->getNumSettings();
       if (strlen(command) > 11) {
-        start = _atoi(command+12);
+        start = parseStartIndex(command+12, end);
       }
       if (start >= end) {
         strcpy(reply, "no custom var");
       } else {
-        sprintf(dp, "%d vars\n", end);
+        snprintf(dp, (size_t)(lim - dp), "%d vars\n", end);
         dp = strchr(dp, 0);
         int i;
-        for (i = start; i < end && (dp-reply < 134); i++) {
-          sprintf(dp, "%s=%s\n",
-            _sensors->getSettingName(i),
-            _sensors->getSettingValue(i));
+        for (i = start; i < end; i++) {
+          const char* name = _sensors->getSettingName(i);
+          const char* value = _sensors->getSettingValue(i);
+          if (name == NULL || value == NULL) {
+            // Out of range for this manager, so there is nothing further to list. Stopping here
+            // keeps a NULL out of %s, where it is undefined behaviour rather than "(null)" on the
+            // C libraries these targets link against.
+            end = i;
+            break;
+          }
+          size_t row_len = strlen(name) + strlen(value) + 2;  // "name" "=" "value" "\n"
+          // Stop before a row that would leave no room for the continuation marker, so the page
+          // stays resumable. Never stop on the first row of a page: that emits "... next:<start>"
+          // and never advances, so an over-long first row is truncated into the buffer instead.
+          if (i > start && row_len + CLI_MARKER_RESERVE >= (size_t)(lim - dp)) break;
+          snprintf(dp, (size_t)(lim - dp), "%s=%s\n", name, value);
           dp = strchr(dp, 0);
         }
         if (i < end) {
-          sprintf(dp, "... next:%d", i);
-        } else {
+          snprintf(dp, (size_t)(lim - dp), "... next:%d", i);
+        } else if (dp > reply) {
           *(dp-1) = 0; // remove last CR
         }
       }
