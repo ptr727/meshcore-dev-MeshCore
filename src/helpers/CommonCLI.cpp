@@ -69,6 +69,18 @@ static void hwPrintLine(const char* fmt, ...) {
   Serial.println(line);
 }
 
+// Parses a paging `start` argument into a bounded index.
+//
+// _atoi() returns uint32_t, and casting a large value straight to int wraps negative: a start of
+// 4294967295 becomes -1, which begins the loop below the first index and emits "... next:-1".
+// A client resuming from that parses "-1" back to 0, because _atoi() stops at the sign, so paging
+// never advances. Clamping to total instead makes an out-of-range start answer "no more".
+static int hwParseStart(const char* sp, int total) {
+  uint32_t value = _atoi(sp);
+  if (total < 0) return 0;
+  return (value > (uint32_t) total) ? total : (int) value;
+}
+
 // Renders a float as a fixed-point string using integer maths, because float formatting is a
 // link-time option on the embedded C libraries this tree builds against and nothing here needs it.
 //
@@ -807,7 +819,7 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       return;
     }
     int total = _sensors->getNumDetectedDevices();
-    int start = (sub[3] == ' ') ? (int) _atoi(&sub[4]) : 0;
+    int start = (sub[3] == ' ') ? hwParseStart(&sub[4], total) : 0;
     if (total == 0) {
       strcpy(reply, "i2c 0 dev");
       return;
@@ -848,7 +860,7 @@ void CommonCLI::handleHwInfoCmd(uint32_t sender_timestamp, char* command, char* 
       return;
     }
     int total = _sensors->getNumActiveSensors();
-    int start = (sub[7] == ' ') ? (int) _atoi(&sub[8]) : 0;
+    int start = (sub[7] == ' ') ? hwParseStart(&sub[8], total) : 0;
     if (total == 0) {
       strcpy(reply, "0 active");
       return;
