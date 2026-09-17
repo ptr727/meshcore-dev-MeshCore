@@ -69,6 +69,22 @@ static void hwPrintLine(const char* fmt, ...) {
   Serial.println(line);
 }
 
+// Renders a float as a fixed-point string using integer maths, because float formatting is a
+// link-time option on the embedded C libraries this tree builds against and nothing here needs it.
+//
+// The sign is taken from the value before truncation. Casting first loses it: (int)(-0.5) is 0, so
+// a temperature of -0.5 C would print as "0.5" and a sub-zero node would report as above freezing.
+// The magnitude is rounded rather than truncated, so 27.68 reads 27.7 instead of 27.6.
+static void hwFormatFixed(char* out, size_t out_len, float value, unsigned places) {
+  unsigned long scale = 1;
+  for (unsigned i = 0; i < places; i++) scale *= 10;
+  bool negative = (value < 0.0f);
+  float magnitude = negative ? -value : value;
+  unsigned long scaled = (unsigned long)(magnitude * (float) scale + 0.5f);
+  snprintf(out, out_len, "%s%lu.%0*lu",
+           negative ? "-" : "", scaled / scale, (int) places, scaled % scale);
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -577,7 +593,9 @@ void CommonCLI::dumpHardwareInfo() {
     if (isnan(t)) {
       hwPrintLine("mcu temp  : not available");
     } else {
-      hwPrintLine("mcu temp  : %d.%01u C", (int) t, (unsigned)(fabs(t * 10)) % 10);
+      char temp[16];
+      hwFormatFixed(temp, sizeof(temp), t, 1);
+      hwPrintLine("mcu temp  : %s C", temp);
     }
   }
   hwPrintLine("startup   : %u", _board->getStartupReason());
@@ -597,7 +615,9 @@ void CommonCLI::dumpHardwareInfo() {
     if (m == 0.0f) {
       hwPrintLine("adc mult  : not reported");
     } else {
-      hwPrintLine("adc mult  : %d.%03u", (int) m, (unsigned)(fabs(m) * 1000) % 1000);
+      char mult[16];
+      hwFormatFixed(mult, sizeof(mult), m, 3);
+      hwPrintLine("adc mult  : %s", mult);
     }
   }
   {
