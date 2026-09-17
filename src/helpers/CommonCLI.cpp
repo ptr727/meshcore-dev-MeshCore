@@ -366,7 +366,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         if (i < end) {
           snprintf(dp, (size_t)(lim - dp), "... next:%d", i);
         } else if (dp > reply && *(dp-1) == '\n') {
-          *(dp-1) = 0; // remove last CR, when the final row was not truncated out of one
+          *(dp-1) = 0; // remove the row terminator, which a truncated final row does not carry
         }
       }
     } else if (memcmp(command, "region", 6) == 0) {
