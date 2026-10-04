@@ -33,14 +33,37 @@ static bool rtc_8130_success = false;
 // own values, notably 37h bit 7, the LSB of the factory frequency calibration.
 static const uint8_t rv3028_config[][3] = {
   { RV3028_EE_CLKOUT, 0x80, 0x00 },  // CLKOE = 0: CLKOUT pin off
-  { RV3028_EE_BACKUP, 0x2F, 0x24 },  // TCE = 1, BSM = 01 (Direct Switching Mode), TCR = 3 kOhm
+  // TCE = 1, FEDE = 1 (manual: "should always be set to 1"), BSM = 01 (DSM), TCR = 3 kOhm
+  { RV3028_EE_BACKUP, 0x3F, 0x34 },
 };
 #define RV3028_CONFIG_COUNT (sizeof(rv3028_config) / sizeof(rv3028_config[0]))
+
+// Melopero's readFromRegister() returns 0xFF when the I2C transfer fails, and its writes report
+// nothing. A failed read must never be written back, least of all to the EEPROM, so these check.
+static bool rv3028Read(uint8_t reg, uint8_t& val) {
+  TwoWire* wire = rtc_rv3028.i2c;
+  wire->beginTransmission(RV3028_ADDRESS);
+  wire->write(reg);
+  if (wire->endTransmission() != 0 || wire->requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)1) != 1) {
+    return false;
+  }
+  val = wire->read();
+  return true;
+}
+
+static bool rv3028Write(uint8_t reg, uint8_t val) {
+  TwoWire* wire = rtc_rv3028.i2c;
+  wire->beginTransmission(RV3028_ADDRESS);
+  wire->write(reg);
+  wire->write(val);
+  return wire->endTransmission() == 0;
+}
 
 // Waits for EEbusy to clear: ~66 ms after the RTC powers on, ~63 ms for an Update
 static bool rv3028EepromIdle() {
   for (int i = 0; i < 20; i++) {
-    if ((rtc_rv3028.readFromRegister(RV3028_STATUS) & 0x80) == 0) return true;
+    uint8_t status;
+    if (rv3028Read(RV3028_STATUS, status) && (status & 0x80) == 0) return true;
     delay(10);
   }
   return false;
@@ -48,8 +71,7 @@ static bool rv3028EepromIdle() {
 
 // Manual 4.6.7: wait 10 ms after an Update, 1 ms after a Refresh, before checking EEbusy
 static bool rv3028EepromCommand(uint8_t cmd, uint32_t wait_ms) {
-  rtc_rv3028.writeToRegister(RV3028_EE_COMMAND, 0x00);
-  rtc_rv3028.writeToRegister(RV3028_EE_COMMAND, cmd);
+  if (!rv3028Write(RV3028_EE_COMMAND, 0x00) || !rv3028Write(RV3028_EE_COMMAND, cmd)) return false;
   delay(wait_ms);
   return rv3028EepromIdle();
 }
@@ -59,17 +81,21 @@ static bool rv3028EepromCommand(uint8_t cmd, uint32_t wait_ms) {
 // turns the switchover and trickle charger back off. The EEPROM is written only when it does
 // not already hold the configuration. Returns false if the configuration was not stored.
 static bool rv3028StoreConfig() {
-  if (!rv3028EepromIdle()) return false;
-  rtc_rv3028.andOrRegister(RV3028_CONTROL1, 0xFF, 0x08);  // EERD = 1
+  uint8_t ctrl1;
+  if (!rv3028Read(RV3028_CONTROL1, ctrl1)) return false;
+
+  // Manual 4.6.7: set EERD = 1 to disable the automatic refresh, then wait for EEbusy = 0
+  bool ok = rv3028Write(RV3028_CONTROL1, ctrl1 | 0x08) && rv3028EepromIdle();
 
   // Refresh first, so the comparison is against what the EEPROM holds rather than the RAM
-  bool ok = rv3028EepromCommand(RV3028_EE_REFRESH, 1);
+  ok = ok && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
   bool changed = false;
   for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
     uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
-    uint8_t old = rtc_rv3028.readFromRegister(reg);
-    if ((old & mask) != val) {
-      rtc_rv3028.writeToRegister(reg, (old & ~mask) | val);
+    uint8_t old;
+    ok = rv3028Read(reg, old);
+    if (ok && (old & mask) != val) {
+      ok = rv3028Write(reg, (old & ~mask) | val);
       changed = true;
     }
   }
@@ -77,13 +103,14 @@ static bool rv3028StoreConfig() {
     // Refresh after the Update, so the read-back sees what the EEPROM now holds
     ok = rv3028EepromCommand(RV3028_EE_UPDATE, 10) && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
     for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
-      uint8_t now = rtc_rv3028.readFromRegister(rv3028_config[i][0]);
-      ok = (now & rv3028_config[i][1]) == rv3028_config[i][2];
+      uint8_t now;
+      ok = rv3028Read(rv3028_config[i][0], now);
+      ok = ok && (now & rv3028_config[i][1]) == rv3028_config[i][2];
     }
   }
 
-  rtc_rv3028.andOrRegister(RV3028_CONTROL1, 0xF7, 0x00);  // EERD = 0
-  return ok;
+  // EERD = 0 on every path once it may have been set
+  return rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -106,7 +133,8 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
       // Fall back to setting the RAM mirror only, which holds until the next refresh
       for (size_t i = 0; i < RV3028_CONFIG_COUNT; i++) {
         uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
-        rtc_rv3028.andOrRegister(reg, (uint8_t)~mask, val);
+        uint8_t old;
+        if (rv3028Read(reg, old)) rv3028Write(reg, (old & ~mask) | val);
       }
     }
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
