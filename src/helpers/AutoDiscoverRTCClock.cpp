@@ -45,9 +45,11 @@ struct RtcId {
 };
 
 #if !defined(DISABLE_DS3231_PROBE)
-// DS3231 (Maxim 19-5170 Rev 10): Figure 1, p. 11; OSF in Status (0Fh) bit 7, p. 14
+// DS3231 (Maxim 19-5170 Rev 10): Figure 1, p. 11; OSF in Status (0Fh) bit 7, p. 14. 00h bit 7
+// is left out: a DS1307 at 0x68, which this code also drives, powers up with its clock-halt bit
+// there set (Maxim DS1307 Rev 3/15, Table 2 and text, p. 8). Its other bits match.
 static const RtcId DS3231_ID =
-  { 0x00, { 0x80, 0x80, 0x80, 0xF8, 0xC0, 0x60, 0x00 }, 4, 0x0F, 0x80 };
+  { 0x00, { 0x00, 0x80, 0x80, 0xF8, 0xC0, 0x60, 0x00 }, 4, 0x0F, 0x80 };
 #endif
 // RV3028 (RV-3028-C7 App Manual Rev 1.4): 3.2, p. 12; PORF in Status (0Eh) bit 0, 3.7, p. 22
 static const RtcId RV3028_ID =
