@@ -32,7 +32,8 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
 //  - bits documented as always 0 must read 0 (the PCF8563 documents none), and the seven
 //    registers must not all read 0xFF, as an erased EEPROM does;
 //  - seconds, minutes, date and month must be valid BCD in range, unless the chip's power-loss
-//    flag is set: each of these chips sets it at power-up, when its time may be undefined.
+//    flag is set: each of these chips sets it at power-up, when its time may be undefined
+//    (not checked for the RX8130CE, see its entry below).
 // The year is not checked, as MeshCore can write an out-of-range one from a bad epoch. This
 // cannot catch every device: one whose bytes happen to fit is still adopted, as before.
 struct RtcId {
