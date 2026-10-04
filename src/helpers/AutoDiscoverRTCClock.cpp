@@ -43,7 +43,8 @@ static const uint8_t rv3028_config[][3] = {
 #define RV3028_CONFIG_COUNT (sizeof(rv3028_config) / sizeof(rv3028_config[0]))
 
 // Melopero's readFromRegister() returns 0xFF when the I2C transfer fails, and its writes report
-// nothing. A failed read must never be written back, least of all to the EEPROM, so these check.
+// nothing. A failed read must never be written back, least of all to the EEPROM, so these two
+// helpers check every transfer.
 static bool rv3028Read(uint8_t reg, uint8_t& val) {
   TwoWire* wire = rtc_rv3028.i2c;
   wire->beginTransmission(RV3028_ADDRESS);
