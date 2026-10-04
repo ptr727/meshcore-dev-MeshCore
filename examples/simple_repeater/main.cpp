@@ -151,6 +151,9 @@ void loop() {
     command[len - 1] = 0;  // replace newline with C string null terminator
     char reply[160];
     reply[0] = 0;
+    extern bool rtc_probe_diag(const char* cmd, char* reply);  // THROWAWAY probe
+    if (rtc_probe_diag(command, reply)) {
+    } else
 #ifdef ETHERNET_ENABLED
     if (!ethernet_handle_command(command, reply)) {
       the_mesh.handleCommand(0, command, reply);
