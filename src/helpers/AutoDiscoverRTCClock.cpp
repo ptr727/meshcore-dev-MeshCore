@@ -26,55 +26,46 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
   return (error == 0);
 }
 
-// An ACK only says that something answers at an RTC's address. An IMU at 0x68 or an EEPROM in
+// An ACK only says that something answers at an RTC's address: an IMU at 0x68 or an EEPROM in
 // 0x50-0x57 answers too, and would then be read as the clock and written on every time sync.
-// So each RTC is adopted only if its seven time registers read like that chip's, per the
-// datasheets cited below.
+// So an RTC is adopted only if its time registers read like that chip's, per its datasheet:
+//  - bits documented as always 0 must read 0 (the PCF8563 documents none);
+//  - seconds, minutes, date and month must be valid BCD in range, unless the chip's power-loss
+//    flag is set, which every one of these chips sets at power-up, when its time is undefined.
+// The year is not checked, as MeshCore can write an out-of-range one from a bad epoch. This
+// cannot catch every device: one whose bytes happen to fit is still adopted, as before.
+struct RtcId {
+  uint8_t time_reg;   // seconds register; the seven time registers follow it
+  uint8_t zero[7];    // bits that always read 0
+  uint8_t date_idx;   // index of the date register within the seven
+  uint8_t flag_reg;   // power-loss flag register and bit
+  uint8_t flag_bit;
+};
 
-static bool rtcReadTime(TwoWire& wire, uint8_t addr, uint8_t reg, uint8_t t[7]) {
+#if !defined(DISABLE_DS3231_PROBE)
+// DS3231 (Maxim 19-5170 Rev 10): Figure 1, p. 11; OSF in Status (0Fh) bit 7, p. 14
+static const RtcId DS3231_ID =
+  { 0x00, { 0x80, 0x80, 0x80, 0xF8, 0xC0, 0x60, 0x00 }, 4, 0x0F, 0x80 };
+#endif
+// RV3028 (RV-3028-C7 App Manual Rev 1.4): 3.2, p. 12; PORF in Status (0Eh) bit 0, 3.7, p. 22
+static const RtcId RV3028_ID =
+  { 0x00, { 0x80, 0x80, 0xC0, 0xF8, 0xC0, 0xE0, 0x00 }, 4, 0x0E, 0x01 };
+// PCF8563 (NXP Rev 11.1): unused bits are "not relevant", not 0, Table 4, p. 10; VL in
+// VL_seconds (02h) bit 7, Table 8, p. 13, and set at power-up, Table 27, p. 24
+static const RtcId PCF8563_ID = { 0x02, { 0 }, 3, 0x02, 0x80 };
+// RX8130CE (Epson ETM50E-10): read value always 0, 13.2.1, p. 22; VLF in Flag (1Dh) bit 1,
+// 13.3.5, p. 25, and set at power-up, 13.2.2, p. 23
+static const RtcId RX8130CE_ID =
+  { 0x10, { 0x80, 0x80, 0xC0, 0x80, 0xC0, 0xE0, 0x00 }, 4, 0x1D, 0x02 };
+
+// Reads n registers from reg, with a repeated start as every one of these datasheets documents
+static bool rtcRead(TwoWire& wire, uint8_t addr, uint8_t reg, uint8_t* buf, uint8_t n) {
   wire.beginTransmission(addr);
   wire.write(reg);
-  if (wire.endTransmission() != 0) return false;
-  if (wire.requestFrom(addr, (uint8_t)7) != 7) return false;
-  for (int i = 0; i < 7; i++) t[i] = wire.read();
+  if (wire.endTransmission(false) != 0) return false;
+  if (wire.requestFrom(addr, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = wire.read();
   return true;
-}
-
-// True if two reads of the time registers both rule the device out. A failed read proves
-// nothing, so the device is adopted as before, and one corrupted read cannot hide a real RTC.
-static bool rtcRuledOut(TwoWire& wire, uint8_t addr, uint8_t reg,
-                        bool (*ruled_out)(const uint8_t t[7])) {
-  for (int i = 0; i < 2; i++) {
-    uint8_t t[7];
-    if (!rtcReadTime(wire, addr, reg, t) || !ruled_out(t)) return false;
-  }
-  MESH_DEBUG_PRINTLN("RTC: device at 0x%02X does not read like the RTC expected there", addr);
-  return true;
-}
-
-static bool anyBitSet(const uint8_t t[7], const uint8_t zero[7]) {
-  for (int i = 0; i < 7; i++) {
-    if (t[i] & zero[i]) return true;
-  }
-  return false;
-}
-
-// DS3231, 00h-06h: bits shown as 0 in Figure 1 (Maxim 19-5170 Rev 10, p. 11)
-static bool ds3231RuledOut(const uint8_t t[7]) {
-  static const uint8_t zero[7] = { 0x80, 0x80, 0x80, 0xF8, 0xC0, 0x60, 0x00 };
-  return anyBitSet(t, zero);
-}
-
-// RV3028, 00h-06h: bits that always read 0 (RV-3028-C7 App Manual Rev 1.4, 3.2-3.3, pp. 12-14)
-static bool rv3028RuledOut(const uint8_t t[7]) {
-  static const uint8_t zero[7] = { 0x80, 0x80, 0xC0, 0xF8, 0xC0, 0xE0, 0x00 };
-  return anyBitSet(t, zero);
-}
-
-// RX8130CE, 10h-16h: bits whose "read value is always 0" (Epson ETM50E-10, 13.2.1, p. 22)
-static bool rx8130ceRuledOut(const uint8_t t[7]) {
-  static const uint8_t zero[7] = { 0x80, 0x80, 0xC0, 0x80, 0xC0, 0xE0, 0x00 };
-  return anyBitSet(t, zero);
 }
 
 static bool bcdInRange(uint8_t v, uint8_t lo, uint8_t hi) {
@@ -83,29 +74,43 @@ static bool bcdInRange(uint8_t v, uint8_t lo, uint8_t hi) {
   return d >= lo && d <= hi;
 }
 
-// PCF8563, 02h-08h. Its unused bits are "not relevant" rather than 0, so this checks the field
-// ranges instead (NXP PCF8563 Rev 11.1, Table 4, p. 10). With VL set (02h bit 7) the time is
-// undefined (Table 27, p. 24), so a chip that lost power is still adopted and can be set.
-static bool pcf8563RuledOut(const uint8_t t[7]) {
+// 1 if this read rules the device out, 0 if not, -1 if a read failed
+static int rtcCheck(TwoWire& wire, uint8_t addr, const RtcId& id) {
+  uint8_t t[7];
+  if (!rtcRead(wire, addr, id.time_reg, t, 7)) return -1;
   bool all_ff = true;
-  for (int i = 0; i < 7; i++) all_ff = all_ff && t[i] == 0xFF;
-  if (all_ff) return true;  // an erased EEPROM, not a chip whose VL is set
-  if (t[0] & 0x80) return false;
-  return !(bcdInRange(t[0] & 0x7F, 0, 59) && bcdInRange(t[1] & 0x7F, 0, 59)
-           && bcdInRange(t[2] & 0x3F, 0, 23) && bcdInRange(t[3] & 0x3F, 1, 31)
-           && (t[4] & 0x07) <= 6 && bcdInRange(t[5] & 0x1F, 1, 12) && bcdInRange(t[6], 0, 99));
+  for (int i = 0; i < 7; i++) {
+    if (t[i] & id.zero[i]) return 1;
+    all_ff = all_ff && t[i] == 0xFF;
+  }
+  if (all_ff) return 1;  // an erased EEPROM
+  if (bcdInRange(t[0] & 0x7F, 0, 59) && bcdInRange(t[1] & 0x7F, 0, 59)
+      && bcdInRange(t[id.date_idx] & 0x3F, 1, 31) && bcdInRange(t[5] & 0x1F, 1, 12)) {
+    return 0;
+  }
+  uint8_t flag;
+  if (!rtcRead(wire, addr, id.flag_reg, &flag, 1)) return -1;
+  return (flag & id.flag_bit) ? 0 : 1;  // power was lost, so the time is undefined
+}
+
+// True if two reads both rule the device out. A failed read proves nothing, so the device is
+// adopted as before, and one corrupted read cannot hide a real RTC.
+static bool rtcRuledOut(TwoWire& wire, uint8_t addr, const RtcId& id) {
+  if (rtcCheck(wire, addr, id) != 1 || rtcCheck(wire, addr, id) != 1) return false;
+  MESH_DEBUG_PRINTLN("RTC: device at 0x%02X does not read like the RTC expected there", addr);
+  return true;
 }
 
 void AutoDiscoverRTCClock::begin(TwoWire& wire) {
   #if !defined(DISABLE_DS3231_PROBE)
   if (i2c_probe(wire, DS3231_ADDRESS)
-      && !rtcRuledOut(wire, DS3231_ADDRESS, 0x00, ds3231RuledOut)) {
+      && !rtcRuledOut(wire, DS3231_ADDRESS, DS3231_ID)) {
     ds3231_success = rtc_3231.begin(&wire);
   }
   #endif
 
   if (i2c_probe(wire, RV3028_ADDRESS)
-      && !rtcRuledOut(wire, RV3028_ADDRESS, 0x00, rv3028RuledOut)) {
+      && !rtcRuledOut(wire, RV3028_ADDRESS, RV3028_ID)) {
     rtc_rv3028.initI2C(wire);
     rtc_rv3028.writeToRegister(0x35, 0x00);
     rtc_rv3028.writeToRegister(0x37, 0xB4); // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
@@ -114,13 +119,13 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
   }
 
   if (i2c_probe(wire, PCF8563_ADDRESS)
-      && !rtcRuledOut(wire, PCF8563_ADDRESS, 0x02, pcf8563RuledOut)) {
+      && !rtcRuledOut(wire, PCF8563_ADDRESS, PCF8563_ID)) {
     MESH_DEBUG_PRINTLN("PCF8563: Found");
     rtc_8563_success = rtc_8563.begin(&wire);
   }
 
   if (i2c_probe(wire, RX8130CE_ADDRESS)
-      && !rtcRuledOut(wire, RX8130CE_ADDRESS, 0x10, rx8130ceRuledOut)) {
+      && !rtcRuledOut(wire, RX8130CE_ADDRESS, RX8130CE_ID)) {
     MESH_DEBUG_PRINTLN("RX8130CE: Found");
     rtc_8130.begin(&wire);
     rtc_8130_success = true;
