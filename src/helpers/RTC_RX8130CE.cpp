@@ -95,7 +95,7 @@ bool RTC_RX8130CE::setTime(struct tm *t) {
     buf[1] = bin2bcd(t->tm_sec) & 0x7F;
     buf[2] = bin2bcd(t->tm_min) & 0x7F;
     buf[3] = bin2bcd(t->tm_hour) & 0x3F;
-    buf[4] = 1 << (t->tm_wday % 7);  // WEEK is one-hot: Sunday = 01h ... Saturday = 40h
+    buf[4] = 1 << t->tm_wday;  // one-hot, Sunday = 01h ... Saturday = 40h; gmtime() gives 0-6
     buf[5] = bin2bcd(t->tm_mday) & 0x3F;
     buf[6] = bin2bcd(t->tm_mon + 1) & 0x1F;
     buf[7] = bin2bcd((t->tm_year - 100));
