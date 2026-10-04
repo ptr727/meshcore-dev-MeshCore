@@ -63,11 +63,13 @@ static bool rv3028Write(uint8_t reg, uint8_t val) {
   return wire->endTransmission() == 0;
 }
 
-// Waits for EEbusy to clear: ~66 ms after the RTC powers on, ~16 ms for a byte write
+// Waits for EEbusy to clear: ~66 ms after the RTC powers on, ~16 ms for a byte write. A failed
+// read ends the wait at once, rather than polling a dead bus through each transfer's timeout.
 static bool rv3028EepromIdle() {
   for (int i = 0; i < 100; i++) {
     uint8_t status;
-    if (rv3028Read(RV3028_STATUS, status) && (status & 0x80) == 0) return true;
+    if (!rv3028Read(RV3028_STATUS, status)) return false;
+    if ((status & 0x80) == 0) return true;
     delay(1);
   }
   return false;
@@ -151,7 +153,7 @@ static bool rv3028SetRam() {
   return ok;
 }
 
-#define RV3028_STORE_RETRY_MS  (60UL * 60 * 1000)  // a failed store blocks while it polls EEbusy
+#define RV3028_STORE_RETRY_MS  (60UL * 60 * 1000)  // each EEbusy wait can take ~0.1 s
 #define RV3028_STORE_RETRIES   3  // a locked chip, or a non-RTC device at 0x52, never succeeds
 
 static bool rv3028_store_pending = false;  // the EEPROM store failed: retried hourly
