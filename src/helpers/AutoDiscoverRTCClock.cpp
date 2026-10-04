@@ -76,7 +76,8 @@ static bool rv3028EepromIdle() {
 }
 
 // Manual 4.6.7: wait 10 ms after an EEPROM write, 1 ms after a read or a Refresh, before
-// checking EEbusy. delay() does not guarantee the full time on every core, hence the extra 1 ms.
+// checking EEbusy. delay() can return early on some cores: the extra 1 ms, with the bus time of
+// the status read that follows, covers it.
 static bool rv3028EepromCommand(uint8_t cmd, uint32_t wait_ms) {
   if (!rv3028Write(RV3028_EE_COMMAND, 0x00) || !rv3028Write(RV3028_EE_COMMAND, cmd)) return false;
   delay(wait_ms + 1);
@@ -112,28 +113,29 @@ static bool rv3028StoreConfig() {
   bool held = ok;
   ok = ok && rv3028Write(RV3028_EE_BACKUP, backup & ~RV3028_BACKUP_BSM);
 
-  bool changed = false;
   for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
-    uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
+    uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1];
+    uint8_t val = rv3028_config[i][2] & mask;
     uint8_t old;
     ok = rv3028EepromRead(reg, old);
-    if (ok && (old & mask) != val) {
-      ok = rv3028EepromWrite(reg, (old & ~mask) | val);
-      changed = true;
-    }
+    if (ok && (old & mask) != val) ok = rv3028EepromWrite(reg, (old & ~mask) | val);
   }
 
-  // Refresh reloads RAM from the EEPROM, so the read-back sees what the EEPROM now holds
+  // Refresh reloads RAM from the EEPROM, which also restores the switchover. The read-back runs
+  // even when nothing was written, so every boot confirms that the switchover came back.
   bool refreshed = ok && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
   ok = refreshed;
-  for (size_t i = 0; ok && changed && i < RV3028_CONFIG_COUNT; i++) {
-    uint8_t now;
-    ok = rv3028Read(rv3028_config[i][0], now);
-    ok = ok && (now & rv3028_config[i][1]) == rv3028_config[i][2];
+  for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
+    uint8_t mask = rv3028_config[i][1], now;
+    ok = rv3028Read(rv3028_config[i][0], now) && (now & mask) == (rv3028_config[i][2] & mask);
   }
 
-  // If the Refresh did not run or finish, put the switchover back rather than leave it disabled
-  if (held && !refreshed) rv3028Write(RV3028_EE_BACKUP, backup);
+  // If the Refresh did not run or finish, put the switchover back rather than leave it disabled,
+  // after giving an EEPROM operation still running the chance to finish (best effort)
+  if (held && !refreshed) {
+    rv3028EepromIdle();
+    rv3028Write(RV3028_EE_BACKUP, backup);
+  }
 
   // EERD = 0 once it may have been set. Read Control1 again first, since the chip clears TE itself
   // when a single-shot countdown ends, so the earlier copy may be stale. If that read fails,
@@ -146,36 +148,50 @@ static bool rv3028StoreConfig() {
 static bool rv3028SetRam() {
   bool ok = true;
   for (size_t i = 0; i < RV3028_CONFIG_COUNT; i++) {
-    uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
+    uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1];
+    uint8_t val = rv3028_config[i][2] & mask;
     uint8_t old;
     ok = rv3028Read(reg, old) && rv3028Write(reg, (old & ~mask) | val) && ok;
   }
   return ok;
 }
 
-#define RV3028_STORE_RETRY_MS  (60UL * 60 * 1000)  // each EEbusy wait can take ~0.1 s
-#define RV3028_STORE_RETRIES   3  // a locked chip, or a non-RTC device at 0x52, never succeeds
+// A failed configuration is retried from getCurrentTime(), a few times per boot only: a
+// password-locked chip, or a device at 0x52 that is not an RV3028, never succeeds, and every
+// attempt writes to it again.
+#define RV3028_RETRY_MS  (10UL * 60 * 1000)
+#define RV3028_RETRIES   3
 
-static bool rv3028_store_pending = false;  // the EEPROM store failed: retried hourly
-static bool rv3028_ram_pending = false;    // the RAM fallback failed too: retried on each read
-static uint8_t rv3028_store_tries = 0;
-static unsigned long rv3028_store_tried;
+static bool rv3028_pending = false;
+static uint8_t rv3028_tries = 0;
+static unsigned long rv3028_tried;
 
 // Stores the configuration, falling back to the RAM mirror if that fails. Without the EEPROM
 // store the RAM config lasts only until the next refresh, which on a part still holding the
-// factory EEPROM turns the switchover back off, so the store is retried later. If the RAM
-// fallback fails too, the RAM may still hold BSM = 00 from the store, with the switchover off.
+// factory EEPROM turns the switchover back off. If the RAM fallback fails too, the RAM may still
+// hold BSM = 00 from the store, with the switchover off. Either way a retry is scheduled.
 static void rv3028Configure() {
-  rv3028_store_tried = millis();
-  rv3028_store_tries++;
-  rv3028_store_pending = !rv3028StoreConfig();
-  rv3028_ram_pending = rv3028_store_pending && !rv3028SetRam();
-  if (rv3028_store_pending) {
-    MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM (attempt %d)", rv3028_store_tries);
+  rv3028_tried = millis();
+  rv3028_tries++;
+  rv3028_pending = !rv3028StoreConfig();
+  if (rv3028_pending) {
+    rv3028EepromIdle();  // best effort: let an EEPROM operation still running finish first
+    bool ram = rv3028SetRam();
+    MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM, %s in RAM (attempt %d)",
+                       ram ? "set" : "NOT set", rv3028_tries);
   }
-  if (rv3028_ram_pending) {
-    MESH_DEBUG_PRINTLN("RV3028: config not set in RAM either");
+}
+
+// True if a register read shows a bit that an RV3028 always reads as 0 (manual 3.2), so the
+// device at 0x52 is something else, such as an EEPROM, and must not get RV3028 writes. A failed
+// read proves nothing, so it does not count.
+static bool rv3028Impostor() {
+  static const uint8_t zero[7] = { 0x80, 0x80, 0xC0, 0xF8, 0xC0, 0xE0, 0x00 };  // 00h-06h
+  for (uint8_t reg = 0; reg < 7; reg++) {
+    uint8_t val;
+    if (rv3028Read(reg, val) && (val & zero[reg]) != 0) return true;
   }
+  return false;
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -194,7 +210,11 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
   if (i2c_probe(wire, RV3028_ADDRESS)) {
     rtc_rv3028.initI2C(wire);
     // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
-    rv3028Configure();
+    if (rv3028Impostor()) {
+      MESH_DEBUG_PRINTLN("RV3028: device at 0x52 is not an RV3028, config skipped");
+    } else {
+      rv3028Configure();
+    }
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
     rv3028_success = true;
   }
@@ -218,11 +238,9 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
   }
 
   if (rv3028_success) {
-    if (rv3028_store_pending && rv3028_store_tries <= RV3028_STORE_RETRIES
-        && millis() - rv3028_store_tried >= RV3028_STORE_RETRY_MS) {
+    if (rv3028_pending && rv3028_tries <= RV3028_RETRIES
+        && millis() - rv3028_tried >= RV3028_RETRY_MS) {
       rv3028Configure();
-    } else if (rv3028_ram_pending) {
-      rv3028_ram_pending = !rv3028SetRam();
     }
     return DateTime(
         rtc_rv3028.getYear(),
