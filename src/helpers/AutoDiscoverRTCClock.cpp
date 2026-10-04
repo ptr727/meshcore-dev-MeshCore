@@ -90,7 +90,9 @@ static bool rv3028EepromRead(uint8_t reg, uint8_t& val) {
          && rv3028Read(RV3028_EE_DATA, val);
 }
 
+extern int rv3028_diag_store;  // THROWAWAY probe: EEPROM bytes written, -1 failed
 static bool rv3028EepromWrite(uint8_t reg, uint8_t val) {
+  rv3028_diag_store++;
   return rv3028Write(RV3028_EE_ADDR, reg) && rv3028Write(RV3028_EE_DATA, val)
          && rv3028EepromCommand(RV3028_EE_WRITE, 10);
 }
@@ -173,7 +175,9 @@ static unsigned long rv3028_tried;
 static void rv3028Configure() {
   rv3028_tried = millis();
   rv3028_tries++;
+  rv3028_diag_store = 0;
   rv3028_pending = !rv3028StoreConfig();
+  if (rv3028_pending) rv3028_diag_store = -1;
   if (rv3028_pending) {
     rv3028EepromIdle();  // best effort: let an EEPROM operation still running finish first
     bool ram = rv3028SetRam();
