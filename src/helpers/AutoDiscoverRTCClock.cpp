@@ -23,11 +23,15 @@ static bool rtc_8130_success = false;
 // RV3028 registers used to store its configuration in EEPROM (RV-3028-C7 Application Manual, 4.6)
 #define RV3028_STATUS      0x0E  // bit 7: EEbusy
 #define RV3028_CONTROL1    0x0F  // bit 3: EERD, disables the automatic refresh from EEPROM
+#define RV3028_EE_ADDR     0x25
+#define RV3028_EE_DATA     0x26
 #define RV3028_EE_COMMAND  0x27
-#define RV3028_EE_UPDATE   0x11  // copy all configuration RAM to EEPROM
 #define RV3028_EE_REFRESH  0x12  // copy all configuration EEPROM to RAM
+#define RV3028_EE_WRITE    0x21  // write EE_DATA to one EEPROM byte
+#define RV3028_EE_READ     0x22  // read one EEPROM byte into EE_DATA
 #define RV3028_EE_CLKOUT   0x35
 #define RV3028_EE_BACKUP   0x37
+#define RV3028_BACKUP_BSM  0x0C  // 37h switchover mode, 00 = disabled
 
 // Configuration MeshCore sets: { register, mask, value }. Bits outside the mask keep the chip's
 // own values, notably 37h bit 7, the LSB of the factory frequency calibration.
@@ -59,55 +63,75 @@ static bool rv3028Write(uint8_t reg, uint8_t val) {
   return wire->endTransmission() == 0;
 }
 
-// Waits for EEbusy to clear: ~66 ms after the RTC powers on, ~63 ms for an Update
+// Waits for EEbusy to clear: ~66 ms after the RTC powers on, ~16 ms for a byte write
 static bool rv3028EepromIdle() {
-  for (int i = 0; i < 20; i++) {
+  for (int i = 0; i < 100; i++) {
     uint8_t status;
     if (rv3028Read(RV3028_STATUS, status) && (status & 0x80) == 0) return true;
-    delay(10);
+    delay(1);
   }
   return false;
 }
 
-// Manual 4.6.7: wait 10 ms after an Update, 1 ms after a Refresh, before checking EEbusy
+// Manual 4.6.7: wait 10 ms after an EEPROM write, 1 ms after a read or a Refresh, before
+// checking EEbusy
 static bool rv3028EepromCommand(uint8_t cmd, uint32_t wait_ms) {
   if (!rv3028Write(RV3028_EE_COMMAND, 0x00) || !rv3028Write(RV3028_EE_COMMAND, cmd)) return false;
   delay(wait_ms);
   return rv3028EepromIdle();
 }
 
+// One EEPROM byte, read (manual 4.6.6) or written (4.6.5)
+static bool rv3028EepromRead(uint8_t reg, uint8_t& val) {
+  return rv3028Write(RV3028_EE_ADDR, reg) && rv3028EepromCommand(RV3028_EE_READ, 1)
+         && rv3028Read(RV3028_EE_DATA, val);
+}
+
+static bool rv3028EepromWrite(uint8_t reg, uint8_t val) {
+  return rv3028Write(RV3028_EE_ADDR, reg) && rv3028Write(RV3028_EE_DATA, val)
+         && rv3028EepromCommand(RV3028_EE_WRITE, 10);
+}
+
 // Stores rv3028_config in the RV3028's EEPROM. Setting only the RAM mirror does not last: while
 // EERD = 0 the chip reloads it from EEPROM each day at midnight (manual 4.6.2, 4.6.9), which
-// turns the switchover and trickle charger back off. The EEPROM is written only when it does
-// not already hold the configuration. Returns false if the configuration was not stored.
+// turns the switchover and trickle charger back off. The EEPROM is accessed with the automatic
+// refresh held off (EERD = 1, 4.6.7) and the switchover disabled in RAM (3.15.6: BSM must be
+// 00 or 10 for any EEPROM read or write). Each byte is compared against the EEPROM itself and
+// written only if it differs, so the factory calibration in 36h is never rewritten. A closing
+// Refresh reloads RAM from the EEPROM, which restores the switchover. Returns false if the
+// configuration was not stored.
 static bool rv3028StoreConfig() {
-  uint8_t ctrl1;
+  uint8_t ctrl1, backup;
   if (!rv3028Read(RV3028_CONTROL1, ctrl1)) return false;
 
-  // Manual 4.6.7: set EERD = 1 to disable the automatic refresh, then wait for EEbusy = 0
-  bool ok = rv3028Write(RV3028_CONTROL1, ctrl1 | 0x08) && rv3028EepromIdle();
+  // EERD = 1, wait for EEbusy = 0, then disable the switchover while the EEPROM is accessed
+  bool ok = rv3028Write(RV3028_CONTROL1, ctrl1 | 0x08) && rv3028EepromIdle()
+            && rv3028Read(RV3028_EE_BACKUP, backup);
+  bool held = ok;
+  ok = ok && rv3028Write(RV3028_EE_BACKUP, backup & ~RV3028_BACKUP_BSM);
 
-  // Refresh first, so the comparison is against what the EEPROM holds rather than the RAM
-  ok = ok && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
   bool changed = false;
   for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
     uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
     uint8_t old;
-    ok = rv3028Read(reg, old);
+    ok = rv3028EepromRead(reg, old);
     if (ok && (old & mask) != val) {
-      ok = rv3028Write(reg, (old & ~mask) | val);
+      ok = rv3028EepromWrite(reg, (old & ~mask) | val);
       changed = true;
     }
   }
-  if (ok && changed) {
-    // Refresh after the Update, so the read-back sees what the EEPROM now holds
-    ok = rv3028EepromCommand(RV3028_EE_UPDATE, 10) && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
-    for (size_t i = 0; ok && i < RV3028_CONFIG_COUNT; i++) {
-      uint8_t now;
-      ok = rv3028Read(rv3028_config[i][0], now);
-      ok = ok && (now & rv3028_config[i][1]) == rv3028_config[i][2];
-    }
+
+  // Refresh reloads RAM from the EEPROM, so the read-back sees what the EEPROM now holds
+  bool refreshed = ok && rv3028EepromCommand(RV3028_EE_REFRESH, 1);
+  ok = refreshed;
+  for (size_t i = 0; ok && changed && i < RV3028_CONFIG_COUNT; i++) {
+    uint8_t now;
+    ok = rv3028Read(rv3028_config[i][0], now);
+    ok = ok && (now & rv3028_config[i][1]) == rv3028_config[i][2];
   }
+
+  // If the Refresh did not run or finish, put the switchover back rather than leave it disabled
+  if (held && !refreshed) rv3028Write(RV3028_EE_BACKUP, backup);
 
   // EERD = 0 on every path once it may have been set. Read Control1 again first, since the chip
   // clears TE itself when a single-shot countdown ends. A failed read leaves the earlier copy.
