@@ -152,9 +152,11 @@ static bool rv3028SetRam() {
 }
 
 #define RV3028_STORE_RETRY_MS  (60UL * 60 * 1000)  // a failed store blocks while it polls EEbusy
+#define RV3028_STORE_RETRIES   3  // a locked chip, or a non-RTC device at 0x52, never succeeds
 
 static bool rv3028_store_pending = false;  // the EEPROM store failed: retried hourly
 static bool rv3028_ram_pending = false;    // the RAM fallback failed too: retried on each read
+static uint8_t rv3028_store_tries = 0;
 static unsigned long rv3028_store_tried;
 
 // Stores the configuration, falling back to the RAM mirror if that fails. Without the EEPROM
@@ -163,8 +165,15 @@ static unsigned long rv3028_store_tried;
 // fallback fails too, the RAM may still hold BSM = 00 from the store, with the switchover off.
 static void rv3028Configure() {
   rv3028_store_tried = millis();
+  rv3028_store_tries++;
   rv3028_store_pending = !rv3028StoreConfig();
   rv3028_ram_pending = rv3028_store_pending && !rv3028SetRam();
+  if (rv3028_store_pending) {
+    MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM (attempt %d)", rv3028_store_tries);
+  }
+  if (rv3028_ram_pending) {
+    MESH_DEBUG_PRINTLN("RV3028: config not set in RAM either");
+  }
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -207,7 +216,8 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
   }
 
   if (rv3028_success) {
-    if (rv3028_store_pending && millis() - rv3028_store_tried >= RV3028_STORE_RETRY_MS) {
+    if (rv3028_store_pending && rv3028_store_tries <= RV3028_STORE_RETRIES
+        && millis() - rv3028_store_tried >= RV3028_STORE_RETRY_MS) {
       rv3028Configure();
     } else if (rv3028_ram_pending) {
       rv3028_ram_pending = !rv3028SetRam();
