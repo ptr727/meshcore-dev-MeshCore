@@ -29,16 +29,17 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
 // An ACK only says that something answers at an RTC's address: an IMU at 0x68 or an EEPROM in
 // 0x50-0x57 answers too, and would then be read as the clock and written on every time sync.
 // So an RTC is adopted only if its time registers read like that chip's, per its datasheet:
-//  - bits documented as always 0 must read 0 (the PCF8563 documents none);
+//  - bits documented as always 0 must read 0 (the PCF8563 documents none), and the seven
+//    registers must not all read 0xFF, as an erased EEPROM does;
 //  - seconds, minutes, date and month must be valid BCD in range, unless the chip's power-loss
-//    flag is set, which every one of these chips sets at power-up, when its time is undefined.
+//    flag is set: each of these chips sets it at power-up, when its time may be undefined.
 // The year is not checked, as MeshCore can write an out-of-range one from a bad epoch. This
 // cannot catch every device: one whose bytes happen to fit is still adopted, as before.
 struct RtcId {
   uint8_t time_reg;   // seconds register; the seven time registers follow it
   uint8_t zero[7];    // bits that always read 0
   uint8_t date_idx;   // index of the date register within the seven
-  uint8_t flag_reg;   // power-loss flag register and bit
+  uint8_t flag_reg;   // power-loss flag register and bit; flag_bit 0 skips the field check
   uint8_t flag_bit;
 };
 
@@ -53,10 +54,11 @@ static const RtcId RV3028_ID =
 // PCF8563 (NXP Rev 11.1): unused bits are "not relevant", not 0, Table 4, p. 10; VL in
 // VL_seconds (02h) bit 7, Table 8, p. 13, and set at power-up, Table 27, p. 24
 static const RtcId PCF8563_ID = { 0x02, { 0 }, 3, 0x02, 0x80 };
-// RX8130CE (Epson ETM50E-10): read value always 0, 13.2.1, p. 22; VLF in Flag (1Dh) bit 1,
-// 13.3.5, p. 25, and set at power-up, 13.2.2, p. 23
+// RX8130CE (Epson ETM50E-10): read value always 0, 13.2.1, p. 22. No field check: its power-loss
+// flag VLF (1Dh bit 1) cannot vouch for the fields, as RTC_RX8130CE::begin() clears it on every
+// boot without setting the time.
 static const RtcId RX8130CE_ID =
-  { 0x10, { 0x80, 0x80, 0xC0, 0x80, 0xC0, 0xE0, 0x00 }, 4, 0x1D, 0x02 };
+  { 0x10, { 0x80, 0x80, 0xC0, 0x80, 0xC0, 0xE0, 0x00 }, 4, 0x1D, 0x00 };
 
 // Reads n registers from reg, with a repeated start as every one of these datasheets documents
 static bool rtcRead(TwoWire& wire, uint8_t addr, uint8_t reg, uint8_t* buf, uint8_t n) {
@@ -84,6 +86,7 @@ static int rtcCheck(TwoWire& wire, uint8_t addr, const RtcId& id) {
     all_ff = all_ff && t[i] == 0xFF;
   }
   if (all_ff) return 1;  // an erased EEPROM
+  if (id.flag_bit == 0) return 0;
   if (bcdInRange(t[0] & 0x7F, 0, 59) && bcdInRange(t[1] & 0x7F, 0, 59)
       && bcdInRange(t[id.date_idx] & 0x3F, 1, 31) && bcdInRange(t[5] & 0x1F, 1, 12)) {
     return 0;
