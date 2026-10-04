@@ -99,7 +99,7 @@ static bool rv3028EepromWrite(uint8_t reg, uint8_t val) {
 // 00 or 10 for any EEPROM read or write). Each byte is compared against the EEPROM itself and
 // written only if it differs, so the factory calibration in 36h is never rewritten. A closing
 // Refresh reloads RAM from the EEPROM, which restores the switchover. Returns false if the
-// configuration was not stored.
+// configuration was not confirmed stored, or if EERD could not be cleared afterwards.
 static bool rv3028StoreConfig() {
   uint8_t ctrl1, backup;
   if (!rv3028Read(RV3028_CONTROL1, ctrl1)) return false;
@@ -151,9 +151,21 @@ static bool rv3028SetRam() {
   return ok;
 }
 
-// Set when neither the EEPROM store nor the RAM fallback succeeded at boot. The RAM may then hold
-// BSM = 00 from the store, with the switchover off, so getCurrentTime() retries the RAM config.
-static bool rv3028_ram_pending = false;
+#define RV3028_STORE_RETRY_MS  (60UL * 60 * 1000)  // a failed store blocks while it polls EEbusy
+
+static bool rv3028_store_pending = false;  // the EEPROM store failed: retried hourly
+static bool rv3028_ram_pending = false;    // the RAM fallback failed too: retried on each read
+static unsigned long rv3028_store_tried;
+
+// Stores the configuration, falling back to the RAM mirror if that fails. Without the EEPROM
+// store the RAM config lasts only until the next refresh, which on a part still holding the
+// factory EEPROM turns the switchover back off, so the store is retried later. If the RAM
+// fallback fails too, the RAM may still hold BSM = 00 from the store, with the switchover off.
+static void rv3028Configure() {
+  rv3028_store_tried = millis();
+  rv3028_store_pending = !rv3028StoreConfig();
+  rv3028_ram_pending = rv3028_store_pending && !rv3028SetRam();
+}
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
   wire.beginTransmission(addr);
@@ -171,9 +183,7 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
   if (i2c_probe(wire, RV3028_ADDRESS)) {
     rtc_rv3028.initI2C(wire);
     // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
-    if (!rv3028StoreConfig()) {
-      rv3028_ram_pending = !rv3028SetRam();  // fall back to setting the RAM mirror only
-    }
+    rv3028Configure();
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
     rv3028_success = true;
   }
@@ -197,7 +207,9 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
   }
 
   if (rv3028_success) {
-    if (rv3028_ram_pending) {
+    if (rv3028_store_pending && millis() - rv3028_store_tried >= RV3028_STORE_RETRY_MS) {
+      rv3028Configure();
+    } else if (rv3028_ram_pending) {
       rv3028_ram_pending = !rv3028SetRam();
     }
     return DateTime(
