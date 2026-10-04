@@ -133,10 +133,10 @@ static bool rv3028StoreConfig() {
   // If the Refresh did not run or finish, put the switchover back rather than leave it disabled
   if (held && !refreshed) rv3028Write(RV3028_EE_BACKUP, backup);
 
-  // EERD = 0 on every path once it may have been set. Read Control1 again first, since the chip
-  // clears TE itself when a single-shot countdown ends. A failed read leaves the earlier copy.
-  rv3028Read(RV3028_CONTROL1, ctrl1);
-  return rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
+  // EERD = 0 once it may have been set. Read Control1 again first, since the chip clears TE itself
+  // when a single-shot countdown ends, so the earlier copy may be stale. If that read fails,
+  // Control1 is left alone and the store reports failure, so a later retry clears EERD.
+  return rv3028Read(RV3028_CONTROL1, ctrl1) && rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
 }
 
 // Sets rv3028_config in the RAM mirror only, which holds until the next refresh. Returns false
