@@ -109,7 +109,9 @@ static bool rv3028StoreConfig() {
     }
   }
 
-  // EERD = 0 on every path once it may have been set
+  // EERD = 0 on every path once it may have been set. Read Control1 again first, since the chip
+  // clears TE itself when a single-shot countdown ends. A failed read leaves the earlier copy.
+  rv3028Read(RV3028_CONTROL1, ctrl1);
   return rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
 }
 
