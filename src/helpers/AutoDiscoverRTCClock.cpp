@@ -139,6 +139,22 @@ static bool rv3028StoreConfig() {
   return rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
 }
 
+// Sets rv3028_config in the RAM mirror only, which holds until the next refresh. Returns false
+// if any register could not be read or written.
+static bool rv3028SetRam() {
+  bool ok = true;
+  for (size_t i = 0; i < RV3028_CONFIG_COUNT; i++) {
+    uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
+    uint8_t old;
+    ok = rv3028Read(reg, old) && rv3028Write(reg, (old & ~mask) | val) && ok;
+  }
+  return ok;
+}
+
+// Set when neither the EEPROM store nor the RAM fallback succeeded at boot. The RAM may then hold
+// BSM = 00 from the store, with the switchover off, so getCurrentTime() retries the RAM config.
+static bool rv3028_ram_pending = false;
+
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
   wire.beginTransmission(addr);
   uint8_t error = wire.endTransmission();
@@ -156,12 +172,7 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
     rtc_rv3028.initI2C(wire);
     // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
     if (!rv3028StoreConfig()) {
-      // Fall back to setting the RAM mirror only, which holds until the next refresh
-      for (size_t i = 0; i < RV3028_CONFIG_COUNT; i++) {
-        uint8_t reg = rv3028_config[i][0], mask = rv3028_config[i][1], val = rv3028_config[i][2];
-        uint8_t old;
-        if (rv3028Read(reg, old)) rv3028Write(reg, (old & ~mask) | val);
-      }
+      rv3028_ram_pending = !rv3028SetRam();  // fall back to setting the RAM mirror only
     }
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
     rv3028_success = true;
@@ -186,6 +197,9 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
   }
 
   if (rv3028_success) {
+    if (rv3028_ram_pending) {
+      rv3028_ram_pending = !rv3028SetRam();
+    }
     return DateTime(
         rtc_rv3028.getYear(),
         rtc_rv3028.getMonth(),
