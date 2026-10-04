@@ -139,7 +139,8 @@ static bool rv3028StoreConfig() {
 
   // EERD = 0 once it may have been set. Read Control1 again first, since the chip clears TE itself
   // when a single-shot countdown ends, so the earlier copy may be stale. If that read fails,
-  // Control1 is left alone and the store reports failure, so a later retry clears EERD.
+  // Control1 is left alone and the store reports failure, for a retry to clear EERD if one is
+  // left.
   return rv3028Read(RV3028_CONTROL1, ctrl1) && rv3028Write(RV3028_CONTROL1, ctrl1 & ~0x08) && ok;
 }
 
@@ -169,7 +170,8 @@ static unsigned long rv3028_tried;
 // Stores the configuration, falling back to the RAM mirror if that fails. Without the EEPROM
 // store the RAM config lasts only until the next refresh, which on a part still holding the
 // factory EEPROM turns the switchover back off. If the RAM fallback fails too, the RAM may still
-// hold BSM = 00 from the store, with the switchover off. Either way a retry is scheduled.
+// hold BSM = 00 from the store, with the switchover off. Either way it is retried while
+// attempts remain.
 static void rv3028Configure() {
   rv3028_tried = millis();
   rv3028_tries++;
@@ -182,14 +184,17 @@ static void rv3028Configure() {
   }
 }
 
-// True if a register read shows a bit that an RV3028 always reads as 0 (manual 3.2), so the
-// device at 0x52 is something else, such as an EEPROM, and must not get RV3028 writes. A failed
-// read proves nothing, so it does not count.
+// True if a register shows a bit that an RV3028 always reads as 0 (manual 3.2), so the device
+// at 0x52 is something else, such as an EEPROM, and must not get RV3028 writes. Only two reads
+// that agree count, so a failed or corrupted read cannot rule out a real RV3028.
 static bool rv3028Impostor() {
   static const uint8_t zero[7] = { 0x80, 0x80, 0xC0, 0xF8, 0xC0, 0xE0, 0x00 };  // 00h-06h
   for (uint8_t reg = 0; reg < 7; reg++) {
-    uint8_t val;
-    if (rv3028Read(reg, val) && (val & zero[reg]) != 0) return true;
+    uint8_t val, again;
+    if (rv3028Read(reg, val) && (val & zero[reg]) != 0
+        && rv3028Read(reg, again) && (again & zero[reg]) != 0) {
+      return true;
+    }
   }
   return false;
 }
@@ -209,7 +214,8 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
 
   if (i2c_probe(wire, RV3028_ADDRESS)) {
     rtc_rv3028.initI2C(wire);
-    // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
+    // Store the backup switchover config: Direct Switching Mode (DSM), where the switchover to
+    // VBACKUP occurs when VDD < VBACKUP, with the trickle charger on
     if (rv3028Impostor()) {
       MESH_DEBUG_PRINTLN("RV3028: device at 0x52 is not an RV3028, config skipped");
     } else {
