@@ -74,10 +74,10 @@ static bool rv3028EepromIdle() {
 }
 
 // Manual 4.6.7: wait 10 ms after an EEPROM write, 1 ms after a read or a Refresh, before
-// checking EEbusy
+// checking EEbusy. delay() can return up to 1 ms early on some cores, hence the extra 1 ms.
 static bool rv3028EepromCommand(uint8_t cmd, uint32_t wait_ms) {
   if (!rv3028Write(RV3028_EE_COMMAND, 0x00) || !rv3028Write(RV3028_EE_COMMAND, cmd)) return false;
-  delay(wait_ms);
+  delay(wait_ms + 1);
   return rv3028EepromIdle();
 }
 
