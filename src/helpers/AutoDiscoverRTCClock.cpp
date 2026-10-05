@@ -158,33 +158,6 @@ static bool rv3028SetRam() {
   return ok;
 }
 
-// A failed configuration is retried from getCurrentTime(), a few times per boot only: a
-// password-locked chip, or a device at 0x52 that is not an RV3028, never succeeds, and every
-// attempt writes to it again.
-#define RV3028_RETRY_MS  (10UL * 60 * 1000)
-#define RV3028_RETRIES   3
-
-static bool rv3028_pending = false;
-static uint8_t rv3028_tries = 0;
-static unsigned long rv3028_tried;
-
-// Stores the configuration, falling back to the RAM mirror if that fails. Without the EEPROM
-// store the RAM config lasts only until the next refresh, which on a part still holding the
-// factory EEPROM turns the switchover back off. If the RAM fallback fails too, the RAM may still
-// hold BSM = 00 from the store, with the switchover off. Either way it is retried while
-// attempts remain.
-static void rv3028Configure() {
-  rv3028_tried = millis();
-  rv3028_tries++;
-  rv3028_pending = !rv3028StoreConfig();
-  if (rv3028_pending) {
-    rv3028EepromIdle();  // best effort: let an EEPROM operation still running finish first
-    bool ram = rv3028SetRam();
-    MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM, %s in RAM (attempt %d)",
-                       ram ? "set" : "NOT set", rv3028_tries);
-  }
-}
-
 // Reads the time registers 00h-06h in one transfer: 1 if a register shows a bit that an RV3028
 // always reads as 0 (manual 3.2), as an EEPROM at 0x52 would, 0 if none does, -1 if the read
 // failed
@@ -203,13 +176,50 @@ static int rv3028Check() {
   return ruled_out;
 }
 
-// True only if a read shows the device at 0x52 is an RV3028, so its config may be written. A
-// second read is taken when the first rules the device out, so one corrupted read cannot hide a
-// real RV3028. A failed read identifies nothing, and never leads to an EEPROM write.
-static bool rv3028Identified() {
+// 1 if a read of 00h-06h reads like an RV3028, so its config may be written, 0 if two reads
+// both show a bit an RV3028 always reads as 0, -1 if a read failed. A second read is taken when
+// the first rules the device out, so one corrupted read cannot hide a real RV3028. Only those
+// bits are checked, so a device at 0x52 that reads them as 0 still passes.
+static int rv3028Identify() {
   int r = rv3028Check();
   if (r == 1) r = rv3028Check();
-  return r == 0;
+  return r == 0 ? 1 : (r == 1 ? 0 : -1);
+}
+
+// A failed configuration, or one skipped because a read failed, is retried from
+// getCurrentTime(), a few times per boot only: a password-locked chip never succeeds, and every
+// attempt writes to it again.
+#define RV3028_RETRY_MS  (10UL * 60 * 1000)
+#define RV3028_RETRIES   3
+
+static bool rv3028_pending = false;
+static uint8_t rv3028_tries = 0;
+static unsigned long rv3028_tried;
+
+// Stores the configuration once the device reads like an RV3028, falling back to the RAM mirror
+// if that fails. Without the EEPROM store the RAM config lasts only until the next refresh, which
+// on a part still holding the factory EEPROM turns the switchover back off. If the RAM fallback
+// fails too, the RAM may still hold BSM = 00 from the store, with the switchover off. Either way
+// it is retried while attempts remain. A failed identification read writes nothing, and is
+// retried the same way.
+static void rv3028Configure() {
+  rv3028_tried = millis();
+  rv3028_tries++;
+  int id = rv3028Identify();
+  if (id != 1) {
+    rv3028_pending = id < 0;
+    MESH_DEBUG_PRINTLN("RV3028: %s, config skipped (attempt %d)",
+                       id < 0 ? "identification read failed" : "device at 0x52 is not an RV3028",
+                       rv3028_tries);
+    return;
+  }
+  rv3028_pending = !rv3028StoreConfig();
+  if (rv3028_pending) {
+    rv3028EepromIdle();  // best effort: let an EEPROM operation still running finish first
+    bool ram = rv3028SetRam();
+    MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM, %s in RAM (attempt %d)",
+                       ram ? "set" : "NOT set", rv3028_tries);
+  }
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -229,11 +239,7 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
     rtc_rv3028.initI2C(wire);
     // Store the backup switchover config: Direct Switching Mode (DSM), where the switchover to
     // VBACKUP occurs when VDD < VBACKUP, with the trickle charger on
-    if (rv3028Identified()) {
-      rv3028Configure();
-    } else {
-      MESH_DEBUG_PRINTLN("RV3028: device at 0x52 not identified as an RV3028, config skipped");
-    }
+    rv3028Configure();
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
     rv3028_success = true;
   }
