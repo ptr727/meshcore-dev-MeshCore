@@ -23,6 +23,7 @@ static bool rtc_8130_success = false;
 // RV-3028-C7 clock registers, contiguous from 0x00
 #define RV3028_REG_SECONDS  0x00
 #define RV3028_NUM_CLOCK_REGS  7
+#define RV3028_REG_YEAR  0x06
 #define RV3028_REG_STATUS  0x0E
 #define RV3028_STATUS_BSF  0x20  // backup switchover flag
 
@@ -159,11 +160,14 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   return 0;
 }
 
-// Writes the clock registers in one burst, bracketed like a read: BSF is
-// cleared first and must still read 0 after the write. A switchover during the
-// write leaves the chip with the bytes written before it and the rest
-// unchanged, a mixed time that reads back as valid. Returns true only if the
-// write is confirmed, trying twice.
+// Writes the clock registers, bracketed like a read: BSF is cleared first and
+// must still read 0 after the write. A switchover or power cut during a write
+// leaves the bytes written before it with the rest unchanged, a mixed time
+// that reads back as valid. So the year is zeroed first and written last: a
+// write cut before the end leaves year 2000, the chip's reset state (manual
+// 3.18), which reads as a clock not yet set. Seconds is written first in the
+// burst, which resets the prescaler (3.3, p. 14), so no tick lands between the
+// writes. Returns true only if the write is confirmed, trying twice.
 static bool rv3028_write_time(uint32_t time) {
   DateTime dt(time);
   uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
@@ -173,8 +177,11 @@ static bool rv3028_write_time(uint32_t time) {
   };
   for (int attempt = 0; attempt < 2; attempt++) {
     uint8_t status;
+    const uint8_t zero_year = 0;
     if (rv3028_read_status(status) && rv3028_clear_bsf(status)
-        && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS)
+        && rv3028_write_regs(RV3028_REG_YEAR, &zero_year, 1)
+        && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS - 1)
+        && rv3028_write_regs(RV3028_REG_YEAR, &regs[RV3028_NUM_CLOCK_REGS - 1], 1)
         && rv3028_read_status(status) && (status & RV3028_STATUS_BSF) == 0) {
       return true;
     }
@@ -246,11 +253,12 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
 
     // A rejected read is never used: the time runs on from the last accepted
     // or set one, or, before there is one, comes from the fallback clock.
-    // Reaching here means the transfer errored, came up short, the decoded
-    // fields failed validation, or BSF was set, not that the core ignored the
-    // no-stop flag: where it is ignored, endTransmission() still reports
-    // success and the read proceeds. Those causes tend to persist, and
-    // getCurrentTime() runs on every received packet, so report it once.
+    // Reaching here means a time write is not yet confirmed, or the read's
+    // transfer errored, came up short, its decoded fields failed validation,
+    // or BSF was set, not that the core ignored the no-stop flag: where it is
+    // ignored, endTransmission() still reports success and the read proceeds.
+    // Those causes tend to persist, and getCurrentTime() runs on every
+    // received packet, so report it once.
     static bool read_failure_logged = false;
     if (!rv3028_hold && !read_failure_logged) {
       read_failure_logged = true;
