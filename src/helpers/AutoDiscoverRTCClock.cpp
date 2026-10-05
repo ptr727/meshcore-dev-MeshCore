@@ -131,11 +131,14 @@ static bool rv3028StoreConfig() {
     ok = rv3028Read(rv3028_config[i][0], now) && (now & mask) == (rv3028_config[i][2] & mask);
   }
 
-  // If the Refresh did not run or finish, put the switchover back once EEbusy reads 0. While an
-  // EEPROM operation may still be running it stays off, as 3.15.6 requires, until the next
-  // refresh or retry restores it from the EEPROM.
-  if (held && !refreshed && rv3028EepromIdle()) {
-    rv3028Write(RV3028_EE_BACKUP, backup);
+  // If the Refresh did not run or finish, put the switchover back once EEbusy reads 0. A command
+  // whose write reported failure may still have been latched, so the check waits as long as
+  // after a write (4.6.7). While an EEPROM operation may still be running the switchover stays
+  // off, as 3.15.6 requires, until a retry stores the config; on a part whose EEPROM still holds
+  // the factory BSM = 00, a refresh alone does not bring it back.
+  if (held && !refreshed) {
+    delay(11);
+    if (rv3028EepromIdle()) rv3028Write(RV3028_EE_BACKUP, backup);
   }
 
   // EERD = 0 once it may have been set. Read Control1 again first, since the chip clears TE itself
@@ -215,9 +218,9 @@ static unsigned long rv3028_tried;
 // if that fails. Without the EEPROM store the RAM config lasts only until the next refresh, which
 // on a part still holding the factory EEPROM turns the switchover back off. If the RAM fallback
 // fails too, or EEbusy never reads 0, the RAM may still hold BSM = 00 from the store, with the
-// switchover off until the next refresh. Either way it is retried while attempts remain. An
-// identification that is not settled, or a switchover or failed transfer around the boot read,
-// writes no config and is retried the same way.
+// switchover off until a later attempt succeeds. Either way it is retried while attempts
+// remain. An identification that is not settled, or a switchover or failed transfer around the
+// boot read, writes no config and is retried the same way.
 static void rv3028Configure() {
   rv3028_tried = millis();
   rv3028_tries++;
