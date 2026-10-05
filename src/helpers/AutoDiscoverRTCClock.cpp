@@ -177,13 +177,18 @@ static int rv3028Check() {
 }
 
 // 1 if a read of 00h-06h reads like an RV3028, so its config may be written, 0 if two reads
-// both show a bit an RV3028 always reads as 0, -1 if a read failed. A second read is taken when
-// the first rules the device out, so one corrupted read cannot hide a real RV3028. Only those
-// bits are checked, so a device at 0x52 that reads them as 0 still passes.
+// both show a bit an RV3028 always reads as 0, -1 if that is not settled. A second read is taken
+// when the first rules the device out, so one corrupted read cannot hide a real RV3028. Two
+// reads that rule it out count only if BSF reads 0: a switchover releases the bus (manual 4.2),
+// which reads as 1s. Only those bits are checked, so a device at 0x52 that reads them as 0
+// still passes.
 static int rv3028Identify() {
   int r = rv3028Check();
   if (r == 1) r = rv3028Check();
-  return r == 0 ? 1 : (r == 1 ? 0 : -1);
+  if (r == 0) return 1;
+  uint8_t status;
+  if (r == 1 && rv3028Read(RV3028_STATUS, status) && (status & 0x20) == 0) return 0;
+  return -1;
 }
 
 // True if the device stays on VDD across a read of 00h-06h: BSF is cleared, which works only on
@@ -210,8 +215,8 @@ static unsigned long rv3028_tried;
 // if that fails. Without the EEPROM store the RAM config lasts only until the next refresh, which
 // on a part still holding the factory EEPROM turns the switchover back off. If the RAM fallback
 // fails too, the RAM may still hold BSM = 00 from the store, with the switchover off. Either way
-// it is retried while attempts remain. A failed identification read writes nothing, and is
-// retried the same way.
+// it is retried while attempts remain. An identification that is not settled, or a switchover
+// or failed transfer around the boot read, writes no config and is retried the same way.
 static void rv3028Configure() {
   rv3028_tried = millis();
   rv3028_tries++;
@@ -219,13 +224,13 @@ static void rv3028Configure() {
   if (id != 1) {
     rv3028_pending = id < 0;
     MESH_DEBUG_PRINTLN("RV3028: %s, config skipped (attempt %d)",
-                       id < 0 ? "identification read failed" : "device at 0x52 is not an RV3028",
+                       id < 0 ? "identification not settled" : "device at 0x52 is not an RV3028",
                        rv3028_tries);
     return;
   }
   if (!rv3028OnVdd()) {
     rv3028_pending = true;
-    MESH_DEBUG_PRINTLN("RV3028: backup switchover during the boot read, config deferred (attempt %d)",
+    MESH_DEBUG_PRINTLN("RV3028: switchover or failed transfer around the read, config deferred (attempt %d)",
                        rv3028_tries);
     return;
   }
