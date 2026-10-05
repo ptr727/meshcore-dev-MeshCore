@@ -23,8 +23,13 @@ static bool rtc_8130_success = false;
 // RV-3028-C7 clock registers, contiguous from 0x00
 #define RV3028_REG_SECONDS  0x00
 #define RV3028_NUM_CLOCK_REGS  7
+#define RV3028_REG_STATUS  0x0E
+#define RV3028_STATUS_BSF  0x20  // backup switchover flag
 
 static TwoWire* rv3028_wire = NULL;
+static bool rv3028_good = false;   // a burst read has been accepted
+static uint32_t rv3028_good_time;
+static unsigned long rv3028_good_millis;  // millis() at rv3028_good_time
 
 static inline uint8_t bcd_to_dec(uint8_t bcd) {
   return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
@@ -52,19 +57,27 @@ static inline bool is_bcd(uint8_t b) {
 // is defined). Where it is ignored this degrades to stop-then-start, which is
 // what readFromRegister() has always done against this part.
 //
-// Returns false if the transfer fails or the fields are not sane, leaving the
-// caller to fall back to the field-by-field path.
-static bool rv3028_read_clock(uint32_t& unix_time) {
-  if (rv3028_wire == NULL) return false;
+// A switchover to VBACKUP during the read garbles it: the chip disables and
+// resets its I2C interface (manual 4.2, p. 45; 5.10, p. 95), so the rest of
+// the read comes back as 1s, and a byte can still decode to a valid but larger
+// value (year 0x26 read as 0x27). So the read is used only if the backup
+// switchover flag BSF reads 0 after it. A set BSF is cleared, which is possible
+// only on VDD (3.7, p. 22), and the read is rejected. BSF may also be left set
+// by an earlier power cut, so the caller reads once more.
+//
+// Returns 0 with unix_time set, 1 if the read was rejected for a set BSF, or
+// -1 if the transfer failed or the fields are not sane.
+static int rv3028_read_clock(uint32_t& unix_time) {
+  if (rv3028_wire == NULL) return -1;
   TwoWire& wire = *rv3028_wire;
 
   wire.beginTransmission(RV3028_ADDRESS);
   wire.write((uint8_t)RV3028_REG_SECONDS);
-  if (wire.endTransmission(false) != 0) return false;  // no stop where the core honours it
+  if (wire.endTransmission(false) != 0) return -1;  // no stop where the core honours it
 
   if (wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)RV3028_NUM_CLOCK_REGS)
         != RV3028_NUM_CLOCK_REGS) {
-    return false;
+    return -1;
   }
 
   uint8_t regs[RV3028_NUM_CLOCK_REGS];
@@ -82,7 +95,7 @@ static bool rv3028_read_clock(uint32_t& unix_time) {
 
   if (!is_bcd(secs) || !is_bcd(mins) || !is_bcd(hours)
       || !is_bcd(date) || !is_bcd(month) || !is_bcd(year)) {
-    return false;
+    return -1;
   }
 
   DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
@@ -90,10 +103,24 @@ static bool rv3028_read_clock(uint32_t& unix_time) {
 
   // isValid() round-trips through unixtime(), so it rejects out of range
   // fields and impossible dates such as 31 February in one check.
-  if (!dt.isValid()) return false;
+  if (!dt.isValid()) return -1;
+
+  wire.beginTransmission(RV3028_ADDRESS);
+  wire.write((uint8_t)RV3028_REG_STATUS);
+  if (wire.endTransmission(false) != 0 || wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)1) != 1) {
+    return -1;
+  }
+  const uint8_t status = wire.read();
+  if (status & RV3028_STATUS_BSF) {
+    wire.beginTransmission(RV3028_ADDRESS);
+    wire.write((uint8_t)RV3028_REG_STATUS);
+    wire.write((uint8_t)(status & ~RV3028_STATUS_BSF));
+    wire.endTransmission();
+    return 1;
+  }
 
   unix_time = dt.unixtime();
-  return true;
+  return 0;
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -146,7 +173,20 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
 
   if (rv3028_success) {
     uint32_t unix_time;
-    if (rv3028_read_clock(unix_time)) return unix_time;
+    int r = rv3028_read_clock(unix_time);
+    if (r == 1) r = rv3028_read_clock(unix_time);  // BSF is now clear
+    if (r == 0) {
+      rv3028_good = true;
+      rv3028_good_time = unix_time;
+      rv3028_good_millis = millis();
+      return unix_time;
+    }
+
+    // A rejected read is never used. Once a burst read has succeeded, the time
+    // runs on from the last good one.
+    if (rv3028_good) {
+      return rv3028_good_time + (millis() - rv3028_good_millis) / 1000;
+    }
 
     // Reaching here means the transfer errored, came up short, or the decoded
     // fields failed validation, not that the core ignored the no-stop flag:
@@ -187,6 +227,10 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
     auto dt = DateTime(time);
 	  uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
     rtc_rv3028.setTime(dt.year(), dt.month(), weekday, dt.day(), dt.hour(), dt.minute(), dt.second());
+    if (rv3028_good) {  // the time to run on from if the next read is rejected
+      rv3028_good_time = time;
+      rv3028_good_millis = millis();
+    }
   } else if (rtc_8563_success) {
     rtc_8563.adjust(DateTime(time));
   } else if (rtc_8130_success) {
