@@ -144,9 +144,6 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   // DateTime indexes its month table without checking, so the month is
   // range-checked before isValid() decodes it
   if (bcd_to_dec(month) < 1 || bcd_to_dec(month) > 12) return -1;
-  // Year 00 is the chip's reset state (manual 3.18, p. 41) and what a cut
-  // time write leaves, so it reads as a clock not yet set
-  if (year == 0) return -1;
 
   DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
               bcd_to_dec(hours), bcd_to_dec(mins), bcd_to_dec(secs));
@@ -167,8 +164,11 @@ static int rv3028_read_clock(uint32_t& unix_time) {
 // must still read 0 after the write. A switchover or power cut during a write
 // leaves the bytes written before it with the rest unchanged, a mixed time
 // that reads back as valid. So the year is zeroed first and written last: a
-// write cut after the zeroing leaves year 00, which reads as a clock not yet
-// set. This departs from writing the time in one access (manual 4.5, p. 52)
+// write cut after the zeroing leaves year 00, the chip's reset state (manual
+// 3.18, p. 41), so it reads as a 2000-based time, as if never set, rather
+// than a mixed time that passes for the real one. MeshCore then counts on from
+// it, which keeps timestamps from stepping back across reboots on a node that
+// was never set. This departs from writing the time in one access (4.5, p. 52)
 // on purpose. The burst starts with Seconds, which resets the prescaler (3.3,
 // p. 14; 4.5.1, p. 53), so no tick lands between it and the year write that
 // follows at once. Only a tick between the zeroing and the burst could carry
