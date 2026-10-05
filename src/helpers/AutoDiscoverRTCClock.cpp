@@ -134,7 +134,7 @@ static bool rv3028StoreConfig() {
   // If the Refresh did not run or finish, put the switchover back once EEbusy reads 0. A command
   // whose write reported failure may still have been latched, so the check waits as long as
   // after a write (4.6.7). While an EEPROM operation may still be running the switchover stays
-  // off, as 3.15.6 requires, until a retry stores the config; on a part whose EEPROM still holds
+  // off, as 3.15.6 requires, until a later attempt succeeds; on a part whose EEPROM still holds
   // the factory BSM = 00, a refresh alone does not bring it back.
   if (held && !refreshed) {
     delay(11);
