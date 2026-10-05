@@ -30,7 +30,7 @@ static TwoWire* rv3028_wire = NULL;
 static bool rv3028_good = false;   // rv3028_good_time holds an accepted or set time
 static uint32_t rv3028_good_time;
 static unsigned long rv3028_good_millis;  // millis() at rv3028_good_time
-static bool rv3028_hold = false;   // a time write failed, so the RTC is not read until one succeeds
+static bool rv3028_hold = false;   // a time write is not confirmed, so the RTC is not read
 
 static inline uint8_t bcd_to_dec(uint8_t bcd) {
   return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
@@ -140,6 +140,9 @@ static int rv3028_read_clock(uint32_t& unix_time) {
       || !is_bcd(date) || !is_bcd(month) || !is_bcd(year)) {
     return -1;
   }
+  // DateTime indexes its month table without checking, so the month is
+  // range-checked before isValid() decodes it
+  if (bcd_to_dec(month) < 1 || bcd_to_dec(month) > 12) return -1;
 
   DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
               bcd_to_dec(hours), bcd_to_dec(mins), bcd_to_dec(secs));
@@ -159,12 +162,24 @@ static int rv3028_read_clock(uint32_t& unix_time) {
 // Writes the clock registers in one burst, bracketed like a read: BSF is
 // cleared first and must still read 0 after the write. A switchover during the
 // write leaves the chip with the bytes written before it and the rest
-// unchanged, a mixed time that reads back as valid.
-static bool rv3028_write_clock(const uint8_t regs[RV3028_NUM_CLOCK_REGS]) {
-  uint8_t status;
-  return rv3028_read_status(status) && rv3028_clear_bsf(status)
-         && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS)
-         && rv3028_read_status(status) && (status & RV3028_STATUS_BSF) == 0;
+// unchanged, a mixed time that reads back as valid. Returns true only if the
+// write is confirmed, trying twice.
+static bool rv3028_write_time(uint32_t time) {
+  DateTime dt(time);
+  uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
+  const uint8_t regs[RV3028_NUM_CLOCK_REGS] = {
+    dec_to_bcd(dt.second()), dec_to_bcd(dt.minute()), dec_to_bcd(dt.hour()), dec_to_bcd(weekday),
+    dec_to_bcd(dt.day()), dec_to_bcd(dt.month()), dec_to_bcd(dt.year() - 2000)
+  };
+  for (int attempt = 0; attempt < 2; attempt++) {
+    uint8_t status;
+    if (rv3028_read_status(status) && rv3028_clear_bsf(status)
+        && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS)
+        && rv3028_read_status(status) && (status & RV3028_STATUS_BSF) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -229,29 +244,24 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
       }
     }
 
-    // A read rejected for BSF is never used: the time runs on from the last
-    // accepted or set one, or comes from the fallback clock if there is none.
-    if (rv3028_good) return rv3028_run_on();
-    if (r > 0) return _fallback->getCurrentTime();
-
-    // Reaching here means the transfer errored, came up short, or the decoded
-    // fields failed validation, not that the core ignored the no-stop flag:
-    // where it is ignored, endTransmission() still reports success and the
-    // read proceeds. Those causes tend to persist, and getCurrentTime() runs
-    // on every received packet, so report the fallback once.
-    static bool burst_failure_logged = false;
-    if (!burst_failure_logged) {
-      burst_failure_logged = true;
-      MESH_DEBUG_PRINTLN("RV3028: burst read failed, reading fields individually");
+    // A rejected read is never used: the time runs on from the last accepted
+    // or set one, or, before there is one, comes from the fallback clock.
+    // Reaching here means the transfer errored, came up short, the decoded
+    // fields failed validation, or BSF was set, not that the core ignored the
+    // no-stop flag: where it is ignored, endTransmission() still reports
+    // success and the read proceeds. Those causes tend to persist, and
+    // getCurrentTime() runs on every received packet, so report it once.
+    static bool read_failure_logged = false;
+    if (!rv3028_hold && !read_failure_logged) {
+      read_failure_logged = true;
+      MESH_DEBUG_PRINTLN("RV3028: time read rejected (%d)", r);
     }
-    return DateTime(
-        rtc_rv3028.getYear(),
-        rtc_rv3028.getMonth(),
-        rtc_rv3028.getDate(),
-        rtc_rv3028.getHour(),
-        rtc_rv3028.getMinute(),
-        rtc_rv3028.getSecond()
-    ).unixtime();
+    if (!rv3028_good) return _fallback->getCurrentTime();
+    const uint32_t now = rv3028_run_on();
+    // An unconfirmed write may have left a mixed time in the chip, so the
+    // write is repeated until one is confirmed
+    if (rv3028_hold && rv3028_write_time(now)) rv3028_hold = false;
+    return now;
   }
 
   if (rtc_8563_success) {
@@ -270,27 +280,13 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
   if (ds3231_success) {
     rtc_3231.adjust(DateTime(time));
   } else if (rv3028_success) {
-    auto dt = DateTime(time);
-	  uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
-    const uint8_t regs[RV3028_NUM_CLOCK_REGS] = {
-      dec_to_bcd(dt.second()), dec_to_bcd(dt.minute()), dec_to_bcd(dt.hour()), dec_to_bcd(weekday),
-      dec_to_bcd(dt.day()), dec_to_bcd(dt.month()), dec_to_bcd(dt.year() - 2000)
-    };
-    // A write that a switchover interrupted twice is not trusted: the year is
-    // zeroed, so the next boot reads 2000 ("not set") rather than a mixed time,
-    // and until a write succeeds this boot runs on from the time being set.
-    const bool written = rv3028_write_clock(regs) || rv3028_write_clock(regs);
-    if (!written) {
-      const uint8_t zero_year = 0;
-      rv3028_write_regs(RV3028_REG_SECONDS + 6, &zero_year, 1);
-      MESH_DEBUG_PRINTLN("RV3028: time write not confirmed, year cleared");
-    }
-    rv3028_hold = !written;
-    if (rv3028_good || !written) {  // the time to run on from if a read is rejected
-      rv3028_good = true;
-      rv3028_good_time = time;
-      rv3028_good_millis = millis();
-    }
+    // Until a write is confirmed the RTC is not read: this boot runs on from
+    // the time being set, and getCurrentTime() repeats the write
+    rv3028_hold = !rv3028_write_time(time);
+    if (rv3028_hold) MESH_DEBUG_PRINTLN("RV3028: time write not confirmed, will retry");
+    rv3028_good = true;
+    rv3028_good_time = time;
+    rv3028_good_millis = millis();
   } else if (rtc_8563_success) {
     rtc_8563.adjust(DateTime(time));
   } else if (rtc_8130_success) {
