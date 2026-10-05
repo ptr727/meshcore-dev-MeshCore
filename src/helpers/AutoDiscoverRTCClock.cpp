@@ -185,19 +185,31 @@ static void rv3028Configure() {
   }
 }
 
-// True if a register shows a bit that an RV3028 always reads as 0 (manual 3.2), so the device
-// at 0x52 is something else, such as an EEPROM, and must not get RV3028 writes. Only two reads
-// that agree count, so a failed or corrupted read cannot rule out a real RV3028.
-static bool rv3028Impostor() {
+// Reads the time registers 00h-06h in one transfer: 1 if a register shows a bit that an RV3028
+// always reads as 0 (manual 3.2), as an EEPROM at 0x52 would, 0 if none does, -1 if the read
+// failed
+static int rv3028Check() {
   static const uint8_t zero[7] = { 0x80, 0x80, 0xC0, 0xF8, 0xC0, 0xE0, 0x00 };  // 00h-06h
-  for (uint8_t reg = 0; reg < 7; reg++) {
-    uint8_t val, again;
-    if (rv3028Read(reg, val) && (val & zero[reg]) != 0
-        && rv3028Read(reg, again) && (again & zero[reg]) != 0) {
-      return true;
-    }
+  TwoWire* wire = rtc_rv3028.i2c;
+  wire->beginTransmission(RV3028_ADDRESS);
+  wire->write((uint8_t)0x00);
+  if (wire->endTransmission() != 0 || wire->requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)7) != 7) {
+    return -1;
   }
-  return false;
+  int ruled_out = 0;
+  for (uint8_t i = 0; i < 7; i++) {
+    if (wire->read() & zero[i]) ruled_out = 1;
+  }
+  return ruled_out;
+}
+
+// True only if a read shows the device at 0x52 is an RV3028, so its config may be written. A
+// second read is taken when the first rules the device out, so one corrupted read cannot hide a
+// real RV3028. A failed read identifies nothing, and never leads to an EEPROM write.
+static bool rv3028Identified() {
+  int r = rv3028Check();
+  if (r == 1) r = rv3028Check();
+  return r == 0;
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -217,10 +229,10 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
     rtc_rv3028.initI2C(wire);
     // Store the backup switchover config: Direct Switching Mode (DSM), where the switchover to
     // VBACKUP occurs when VDD < VBACKUP, with the trickle charger on
-    if (rv3028Impostor()) {
-      MESH_DEBUG_PRINTLN("RV3028: device at 0x52 is not an RV3028, config skipped");
-    } else {
+    if (rv3028Identified()) {
       rv3028Configure();
+    } else {
+      MESH_DEBUG_PRINTLN("RV3028: device at 0x52 not identified as an RV3028, config skipped");
     }
     rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
     rv3028_success = true;
