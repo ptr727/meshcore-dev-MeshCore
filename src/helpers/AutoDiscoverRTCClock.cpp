@@ -21,7 +21,7 @@ static bool rtc_8130_success = false;
 #define RX8130CE_ADDRESS 0x32
 
 // RV3028 registers used to store its configuration in EEPROM (RV-3028-C7 Application Manual, 4.6)
-#define RV3028_STATUS      0x0E  // bit 7: EEbusy
+#define RV3028_STATUS      0x0E  // bit 7: EEbusy, bit 5: BSF
 #define RV3028_CONTROL1    0x0F  // bit 3: EERD, disables the automatic refresh from EEPROM
 #define RV3028_EE_ADDR     0x25
 #define RV3028_EE_DATA     0x26
@@ -186,6 +186,16 @@ static int rv3028Identify() {
   return r == 0 ? 1 : (r == 1 ? 0 : -1);
 }
 
+// True if the device stays on VDD across a read of 00h-06h: BSF is cleared, which works only on
+// VDD (manual 3.7), the time registers are read, and BSF must still read 0. A switchover in
+// between means VDD is unstable, and the EEPROM needs VDD (4.6.8), so the store waits for a
+// retry. BSF is cleared first, as a power cut before this boot leaves it set.
+static bool rv3028OnVdd() {
+  uint8_t status;
+  return rv3028Read(RV3028_STATUS, status) && rv3028Write(RV3028_STATUS, status & ~0x20)
+         && rv3028Check() == 0 && rv3028Read(RV3028_STATUS, status) && (status & 0x20) == 0;
+}
+
 // A failed configuration, or one skipped because a read failed, is retried from
 // getCurrentTime(), a few times per boot only: a password-locked chip never succeeds, and every
 // attempt writes to it again.
@@ -210,6 +220,12 @@ static void rv3028Configure() {
     rv3028_pending = id < 0;
     MESH_DEBUG_PRINTLN("RV3028: %s, config skipped (attempt %d)",
                        id < 0 ? "identification read failed" : "device at 0x52 is not an RV3028",
+                       rv3028_tries);
+    return;
+  }
+  if (!rv3028OnVdd()) {
+    rv3028_pending = true;
+    MESH_DEBUG_PRINTLN("RV3028: backup switchover during the boot read, config deferred (attempt %d)",
                        rv3028_tries);
     return;
   }
