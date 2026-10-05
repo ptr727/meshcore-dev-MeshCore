@@ -131,10 +131,10 @@ static bool rv3028StoreConfig() {
     ok = rv3028Read(rv3028_config[i][0], now) && (now & mask) == (rv3028_config[i][2] & mask);
   }
 
-  // If the Refresh did not run or finish, put the switchover back rather than leave it disabled,
-  // after giving an EEPROM operation still running the chance to finish (best effort)
-  if (held && !refreshed) {
-    rv3028EepromIdle();
+  // If the Refresh did not run or finish, put the switchover back once EEbusy reads 0. While an
+  // EEPROM operation may still be running it stays off, as 3.15.6 requires, until the next
+  // refresh or retry restores it from the EEPROM.
+  if (held && !refreshed && rv3028EepromIdle()) {
     rv3028Write(RV3028_EE_BACKUP, backup);
   }
 
@@ -214,9 +214,10 @@ static unsigned long rv3028_tried;
 // Stores the configuration once the device reads like an RV3028, falling back to the RAM mirror
 // if that fails. Without the EEPROM store the RAM config lasts only until the next refresh, which
 // on a part still holding the factory EEPROM turns the switchover back off. If the RAM fallback
-// fails too, the RAM may still hold BSM = 00 from the store, with the switchover off. Either way
-// it is retried while attempts remain. An identification that is not settled, or a switchover
-// or failed transfer around the boot read, writes no config and is retried the same way.
+// fails too, or EEbusy never reads 0, the RAM may still hold BSM = 00 from the store, with the
+// switchover off until the next refresh. Either way it is retried while attempts remain. An
+// identification that is not settled, or a switchover or failed transfer around the boot read,
+// writes no config and is retried the same way.
 static void rv3028Configure() {
   rv3028_tried = millis();
   rv3028_tries++;
@@ -236,8 +237,8 @@ static void rv3028Configure() {
   }
   rv3028_pending = !rv3028StoreConfig();
   if (rv3028_pending) {
-    rv3028EepromIdle();  // best effort: let an EEPROM operation still running finish first
-    bool ram = rv3028SetRam();
+    // The switchover must stay off while an EEPROM operation may still be running (3.15.6)
+    bool ram = rv3028EepromIdle() && rv3028SetRam();
     MESH_DEBUG_PRINTLN("RV3028: config not stored in EEPROM, %s in RAM (attempt %d)",
                        ram ? "set" : "NOT set", rv3028_tries);
   }
