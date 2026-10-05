@@ -109,8 +109,8 @@ static uint32_t rv3028_run_on() {
 // by an earlier power cut, so the caller reads once more if it was cleared.
 //
 // Returns 0 with unix_time set, 1 if the read was rejected for a set BSF that
-// is now clear, 2 if BSF is set and could not be cleared, or -1 if the
-// transfer failed or the fields are not sane.
+// is now clear, 2 if BSF is set and could not be cleared, -2 if the clock is
+// not set (year 00), or -1 if the transfer failed or the fields are not sane.
 static int rv3028_read_clock(uint32_t& unix_time) {
   if (rv3028_wire == NULL) return -1;
   TwoWire& wire = *rv3028_wire;
@@ -146,7 +146,7 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   if (bcd_to_dec(month) < 1 || bcd_to_dec(month) > 12) return -1;
   // Year 00 is the chip's reset state (manual 3.18, p. 41) and what a cut
   // time write leaves, so it reads as a clock not yet set
-  if (year == 0) return -1;
+  if (year == 0) return -2;
 
   DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
               bcd_to_dec(hours), bcd_to_dec(mins), bcd_to_dec(secs));
@@ -259,14 +259,15 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
 
     // A rejected read is never used: the time runs on from the last accepted
     // or set one, or, before there is one, comes from the fallback clock.
-    // Reaching here means a time write is not yet confirmed, or the read's
-    // transfer errored, came up short, its decoded fields failed validation,
-    // or BSF was set, not that the core ignored the no-stop flag: where it is
-    // ignored, endTransmission() still reports success and the read proceeds.
-    // Those causes tend to persist, and getCurrentTime() runs on every
-    // received packet, so report it once.
+    // Reaching here means a time write is not yet confirmed, the clock is not
+    // set, or the read's transfer errored, came up short, its decoded fields
+    // failed validation, or BSF was set, not that the core ignored the no-stop
+    // flag: where it is ignored, endTransmission() still reports success and
+    // the read proceeds. Those failures tend to persist, and getCurrentTime()
+    // runs on every received packet, so the first one is reported once; a
+    // clock not yet set is expected and not reported.
     static bool read_failure_logged = false;
-    if (!rv3028_hold && !read_failure_logged) {
+    if (!rv3028_hold && r != -2 && !read_failure_logged) {
       read_failure_logged = true;
       MESH_DEBUG_PRINTLN("RV3028: time read rejected (%d)", r);
     }
