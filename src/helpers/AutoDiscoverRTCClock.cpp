@@ -111,7 +111,8 @@ static uint32_t rv3028_run_on() {
 //
 // Returns 0 with unix_time set, 1 if the read was rejected for a set BSF that
 // is now clear, 2 if BSF is set and could not be cleared, -2 if the clock is
-// not set (year A0h), or -1 if the transfer failed or the fields are not sane.
+// not set (year A0h, or counted on from it), or -1 if the transfer failed or
+// the fields are not sane.
 static int rv3028_read_clock(uint32_t& unix_time) {
   if (rv3028_wire == NULL) return -1;
   TwoWire& wire = *rv3028_wire;
@@ -139,8 +140,10 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   const uint8_t year  = regs[6];
 
   // A0h is the mark a time write sets before its burst, so a write that was
-  // cut reads as a clock not yet set. Year 00 is 2000, a valid year.
-  if (year == RV3028_YEAR_UNSET) return -2;
+  // cut reads as a clock not yet set. Each new year counts the mark on (A1h,
+  // ..., A9h, B0h), never to a BCD year and never to FFh, which is what a read
+  // garbled by an interface reset returns. Year 00 is 2000, a valid year.
+  if (year >= RV3028_YEAR_UNSET && year != 0xFF) return -2;
   if (!is_bcd(secs) || !is_bcd(mins) || !is_bcd(hours)
       || !is_bcd(date) || !is_bcd(month) || !is_bcd(year)) {
     return -1;
