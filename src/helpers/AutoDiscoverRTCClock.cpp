@@ -176,8 +176,12 @@ static int rv3028_read_clock(uint32_t& unix_time) {
 // while the clock counts, and the time then goes in one access from Seconds to
 // Year, as 4.5 (p. 52) requires. Year is the last byte of that burst, so a
 // write cut anywhere in it leaves the mark, which reads as a clock not yet set.
+// The chip counts years 00-99 only, and 2100 would encode as A0h, the mark, so
+// a time outside 2000-2099 is never written: it is not confirmed, and the
+// clock runs on from it without the RTC.
 // Returns true only if the write is confirmed, trying twice.
 static bool rv3028_write_time(uint32_t time) {
+  if (time < 946684800UL || time >= 4102444800UL) return false;  // 2000-01-01 to 2100-01-01
   DateTime dt(time);
   uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
   const uint8_t regs[RV3028_NUM_CLOCK_REGS] = {
