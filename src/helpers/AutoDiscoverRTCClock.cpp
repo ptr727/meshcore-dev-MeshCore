@@ -27,6 +27,8 @@ static bool rtc_8130_success = false;
 #define RV3028_YEAR_UNSET  0xA0  // not BCD, so no time write ever leaves it
 #define RV3028_REG_STATUS  0x0E
 #define RV3028_STATUS_BSF  0x20  // backup switchover flag
+#define RV3028_REG_CONTROL2  0x10
+#define RV3028_CONTROL2_12_24  0x02  // set: Hours counts 1-12 with an AM/PM bit
 
 static TwoWire* rv3028_wire = NULL;
 static bool rv3028_good = false;   // rv3028_good_time holds an accepted or set time
@@ -48,14 +50,17 @@ static inline bool is_bcd(uint8_t b) {
   return (b & 0x0F) <= 9 && (b >> 4) <= 9;
 }
 
-static bool rv3028_read_status(uint8_t& status) {
+// Reads Status (0Eh) and Control 2 (10h) in one access, from 0Eh to 10h.
+static bool rv3028_read_status(uint8_t& status, uint8_t& control2) {
   TwoWire& wire = *rv3028_wire;
   wire.beginTransmission(RV3028_ADDRESS);
   wire.write((uint8_t)RV3028_REG_STATUS);
-  if (wire.endTransmission(false) != 0 || wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)1) != 1) {
+  if (wire.endTransmission(false) != 0 || wire.requestFrom((uint8_t)RV3028_ADDRESS, (uint8_t)3) != 3) {
     return false;
   }
   status = wire.read();
+  wire.read();  // Control 1
+  control2 = wire.read();
   return true;
 }
 
@@ -67,12 +72,26 @@ static bool rv3028_write_regs(uint8_t reg, const uint8_t* data, uint8_t n) {
   return wire.endTransmission() == 0;
 }
 
-// Clears BSF if it is set, which works only on VDD (manual 3.7, p. 22). The
-// other flags are written back as read.
-static bool rv3028_clear_bsf(uint8_t status) {
-  if ((status & RV3028_STATUS_BSF) == 0) return true;
-  const uint8_t cleared = status & ~RV3028_STATUS_BSF;
-  return rv3028_write_regs(RV3028_REG_STATUS, &cleared, 1);
+static inline bool rv3028_unsettled(uint8_t status, uint8_t control2) {
+  return (status & RV3028_STATUS_BSF) || (control2 & RV3028_CONTROL2_12_24);
+}
+
+// Clears BSF if it is set, which works only on VDD (manual 3.7, p. 22), and
+// selects 24 hour mode if 12 hour mode is set. begin() selects 24 hour mode
+// through an unchecked Melopero call, and in 12 hour mode the Hours register
+// holds an AM/PM bit, so PM 1 (21h) would decode as 21:00. Clearing 12_24
+// converts the Hours register itself (02h, p. 15). The other bits of each
+// register are written back as read.
+static bool rv3028_settle(uint8_t status, uint8_t control2) {
+  if (status & RV3028_STATUS_BSF) {
+    const uint8_t cleared = status & ~RV3028_STATUS_BSF;
+    if (!rv3028_write_regs(RV3028_REG_STATUS, &cleared, 1)) return false;
+  }
+  if (control2 & RV3028_CONTROL2_12_24) {
+    const uint8_t cleared = control2 & ~RV3028_CONTROL2_12_24;
+    if (!rv3028_write_regs(RV3028_REG_CONTROL2, &cleared, 1)) return false;
+  }
+  return true;
 }
 
 // The time runs on from the last accepted or set time. The reference moves
@@ -108,11 +127,13 @@ static uint32_t rv3028_run_on() {
 // switchover flag BSF reads 0 after it. A set BSF is cleared, which is possible
 // only on VDD (3.7, p. 22), and the read is rejected. BSF may also be left set
 // by an earlier power cut, so the caller reads once more if it was cleared.
+// 12 hour mode is checked in the same access and handled the same way, before
+// the fields are validated, since most PM hours do not decode as valid hours.
 //
-// Returns 0 with unix_time set, 1 if the read was rejected for a set BSF that
-// is now clear, 2 if BSF is set and could not be cleared, -2 if the clock is
-// not set (year A0h, or counted on from it), or -1 if the transfer failed or
-// the fields are not sane.
+// Returns 0 with unix_time set, 1 if the read was rejected for a set BSF or
+// 12 hour mode that is now cleared, 2 if either could not be cleared, -2 if
+// the clock is not set (year A0h, or counted on from it), or -1 if the
+// transfer failed or the fields are not sane.
 static int rv3028_read_clock(uint32_t& unix_time) {
   if (rv3028_wire == NULL) return -1;
   TwoWire& wire = *rv3028_wire;
@@ -131,9 +152,13 @@ static int rv3028_read_clock(uint32_t& unix_time) {
     regs[i] = wire.read();
   }
 
+  uint8_t status, control2;
+  if (!rv3028_read_status(status, control2)) return -1;
+  if (rv3028_unsettled(status, control2)) return rv3028_settle(status, control2) ? 1 : 2;
+
   const uint8_t secs  = regs[0] & 0x7F;
   const uint8_t mins  = regs[1] & 0x7F;
-  const uint8_t hours = regs[2] & 0x3F;   // begin() selects 24 hour mode
+  const uint8_t hours = regs[2] & 0x3F;   // 24 hour mode, checked above
   // regs[3] is weekday, which DateTime derives itself
   const uint8_t date  = regs[4] & 0x3F;
   const uint8_t month = regs[5] & 0x1F;
@@ -159,23 +184,20 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   // fields and impossible dates such as 31 February in one check.
   if (!dt.isValid()) return -1;
 
-  uint8_t status;
-  if (!rv3028_read_status(status)) return -1;
-  if (status & RV3028_STATUS_BSF) return rv3028_clear_bsf(status) ? 1 : 2;
-
   unix_time = dt.unixtime();
   return 0;
 }
 
-// Writes the clock registers, bracketed like a read: BSF is cleared first and
-// must still read 0 after the write. A switchover during a write resets the
-// interface (manual 4.2, p. 45), as the bus timeout does (4.5.1, p. 53). Tested
-// on a bus timeout, each byte acked before the reset is already stored and the
-// rest keep their old values: a mixed time that reads back as valid. So the
-// year is first marked with A0h, which is not BCD and which the chip keeps
-// while the clock counts, and the time then goes in one access from Seconds to
-// Year, as 4.5 (p. 52) requires. Year is the last byte of that burst, so a
-// write cut anywhere in it leaves the mark, which reads as a clock not yet set.
+// Writes the clock registers, bracketed like a read: BSF is cleared and 24 hour
+// mode selected first, and both must still hold after the write. A switchover
+// during a write resets the interface (manual 4.2, p. 45), as the bus timeout
+// does (4.5.1, p. 53). Tested on a bus timeout, each byte acked before the
+// reset is already stored and the rest keep their old values: a mixed time
+// that reads back as valid. So the year is first marked with A0h, which is not
+// BCD and which the chip keeps while the clock counts, and the time then goes
+// in one access from Seconds to Year, as 4.5 (p. 52) requires. Year is the
+// last byte of that burst, so a write cut anywhere in it leaves the mark,
+// which reads as a clock not yet set.
 // The chip counts years 00-99 only, and 2100 would encode as A0h, the mark, so
 // a time outside 2000-2099 is never written: it is not confirmed, and the
 // clock runs on from it without the RTC.
@@ -188,12 +210,12 @@ static bool rv3028_write_time(uint32_t time) {
     dec_to_bcd(dt.day()), dec_to_bcd(dt.month()), dec_to_bcd(dt.year() - 2000)
   };
   for (int attempt = 0; attempt < 2; attempt++) {
-    uint8_t status;
+    uint8_t status, control2;
     const uint8_t unset_year = RV3028_YEAR_UNSET;
-    if (rv3028_read_status(status) && rv3028_clear_bsf(status)
+    if (rv3028_read_status(status, control2) && rv3028_settle(status, control2)
         && rv3028_write_regs(RV3028_REG_YEAR, &unset_year, 1)
         && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS)
-        && rv3028_read_status(status) && (status & RV3028_STATUS_BSF) == 0) {
+        && rv3028_read_status(status, control2) && !rv3028_unsettled(status, control2)) {
       return true;
     }
   }
@@ -253,7 +275,7 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
     if (!rv3028_hold) {
       uint32_t unix_time;
       r = rv3028_read_clock(unix_time);
-      if (r == 1) r = rv3028_read_clock(unix_time);  // BSF was cleared
+      if (r == 1) r = rv3028_read_clock(unix_time);  // BSF or 12 hour mode was cleared
       if (r == 0) {
         rv3028_good = true;
         rv3028_good_time = unix_time;
@@ -266,11 +288,11 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
     // or set one, or, before there is one, comes from the fallback clock.
     // Reaching here means a time write is not yet confirmed, the clock is not
     // set, or the read's transfer errored, came up short, its decoded fields
-    // failed validation, or BSF was set, not that the core ignored the no-stop
-    // flag: where it is ignored, endTransmission() still reports success and
-    // the read proceeds. Those failures tend to persist, and getCurrentTime()
-    // runs on every received packet, so the first one is reported once; a
-    // clock not yet set is expected and not reported.
+    // failed validation, or BSF or 12 hour mode was set, not that the core
+    // ignored the no-stop flag: where it is ignored, endTransmission() still
+    // reports success and the read proceeds. Those failures tend to persist,
+    // and getCurrentTime() runs on every received packet, so the first one is
+    // reported once; a clock not yet set is expected and not reported.
     static bool read_failure_logged = false;
     if (!rv3028_hold && r != -2 && !read_failure_logged) {
       read_failure_logged = true;
