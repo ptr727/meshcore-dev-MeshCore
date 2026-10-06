@@ -183,9 +183,8 @@ static int rv3028_read_clock(uint32_t& unix_time) {
 static bool rv3028_write_time(uint32_t time) {
   if (time < 946684800UL || time >= 4102444800UL) return false;  // 2000-01-01 to 2100-01-01
   DateTime dt(time);
-  uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
   const uint8_t regs[RV3028_NUM_CLOCK_REGS] = {
-    dec_to_bcd(dt.second()), dec_to_bcd(dt.minute()), dec_to_bcd(dt.hour()), dec_to_bcd(weekday),
+    dec_to_bcd(dt.second()), dec_to_bcd(dt.minute()), dec_to_bcd(dt.hour()), dt.dayOfTheWeek(),
     dec_to_bcd(dt.day()), dec_to_bcd(dt.month()), dec_to_bcd(dt.year() - 2000)
   };
   for (int attempt = 0; attempt < 2; attempt++) {
