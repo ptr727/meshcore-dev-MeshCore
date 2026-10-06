@@ -83,11 +83,14 @@ static inline bool rv3028_unsettled(uint8_t status, uint8_t control2) {
 // Clears BSF if it is set, which works only on VDD (manual 3.7, p. 22), and
 // selects 24 hour mode if 12 hour mode is set: in 12 hour mode the Hours
 // register holds an AM/PM bit, so PM 1 (21h) would decode as 21:00. Clearing
-// 12_24 converts the Hours register itself (02h, p. 15). The other bits of
-// each register are written back as read.
+// 12_24 converts the Hours register itself (02h, p. 15). A Status flag is
+// kept until a 0 is written to it (p. 23), and writing 1 leaves it as it is
+// (tested on two RV-3028-C7), so BSF is cleared by writing 0 to it alone: no
+// other flag is cleared, even one set since Status was read. Control 2's other
+// bits are written back as read.
 static bool rv3028_settle(uint8_t status, uint8_t control2) {
   if (status & RV3028_STATUS_BSF) {
-    const uint8_t cleared = status & ~RV3028_STATUS_BSF;
+    const uint8_t cleared = (uint8_t)~RV3028_STATUS_BSF;
     if (!rv3028_write_regs(RV3028_REG_STATUS, &cleared, 1)) return false;
   }
   if (control2 & RV3028_CONTROL2_12_24) {
