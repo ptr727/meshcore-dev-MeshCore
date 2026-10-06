@@ -29,6 +29,7 @@ static bool rtc_8130_success = false;
 #define RV3028_STATUS_BSF  0x20  // backup switchover flag
 #define RV3028_REG_CONTROL2  0x10
 #define RV3028_CONTROL2_12_24  0x02  // set: Hours counts 1-12 with an AM/PM bit
+#define RV3028_CONTROL2_RESET  0x01  // always reads 0
 
 static TwoWire* rv3028_wire = NULL;
 static bool rv3028_good = false;   // rv3028_good_time holds an accepted or set time
@@ -51,6 +52,9 @@ static inline bool is_bcd(uint8_t b) {
 }
 
 // Reads Status (0Eh) and Control 2 (10h) in one access, from 0Eh to 10h.
+// Control 2's RESET bit always reads 0 (manual p. 24) and Control 2 is the
+// last byte, so a read cut by an interface reset, which returns 1s, shows it
+// set. Such a read fails, so it never drives a write back.
 static bool rv3028_read_status(uint8_t& status, uint8_t& control2) {
   TwoWire& wire = *rv3028_wire;
   wire.beginTransmission(RV3028_ADDRESS);
@@ -61,7 +65,7 @@ static bool rv3028_read_status(uint8_t& status, uint8_t& control2) {
   status = wire.read();
   wire.read();  // Control 1
   control2 = wire.read();
-  return true;
+  return (control2 & RV3028_CONTROL2_RESET) == 0;
 }
 
 static bool rv3028_write_regs(uint8_t reg, const uint8_t* data, uint8_t n) {
@@ -77,11 +81,10 @@ static inline bool rv3028_unsettled(uint8_t status, uint8_t control2) {
 }
 
 // Clears BSF if it is set, which works only on VDD (manual 3.7, p. 22), and
-// selects 24 hour mode if 12 hour mode is set. begin() selects 24 hour mode
-// through an unchecked Melopero call, and in 12 hour mode the Hours register
-// holds an AM/PM bit, so PM 1 (21h) would decode as 21:00. Clearing 12_24
-// converts the Hours register itself (02h, p. 15). The other bits of each
-// register are written back as read.
+// selects 24 hour mode if 12 hour mode is set: in 12 hour mode the Hours
+// register holds an AM/PM bit, so PM 1 (21h) would decode as 21:00. Clearing
+// 12_24 converts the Hours register itself (02h, p. 15). The other bits of
+// each register are written back as read.
 static bool rv3028_settle(uint8_t status, uint8_t control2) {
   if (status & RV3028_STATUS_BSF) {
     const uint8_t cleared = status & ~RV3028_STATUS_BSF;
@@ -242,7 +245,7 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) {
     rtc_rv3028.initI2C(wire);
     rtc_rv3028.writeToRegister(0x35, 0x00);
     rtc_rv3028.writeToRegister(0x37, 0xB4); // Direct Switching Mode (DSM): when VDD < VBACKUP, switchover occurs from VDD to VBACKUP
-    rtc_rv3028.set24HourMode(); // Set the device to use the 24hour format (default) instead of the 12 hour format
+    // 24 hour mode is selected, with checks, by each time read and write
     rv3028_success = true;
   }
 
