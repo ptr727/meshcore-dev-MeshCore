@@ -36,6 +36,13 @@ static bool rv3028_good = false;   // rv3028_good_time holds an accepted or set 
 static uint32_t rv3028_good_time;
 static unsigned long rv3028_good_millis;  // millis() at rv3028_good_time
 static bool rv3028_hold = false;   // a time write is not confirmed, so the RTC is not read
+static unsigned long rv3028_hold_millis;  // millis() at the last write attempt
+static uint8_t rv3028_hold_tries;   // write attempts since the time was set
+
+// An unconfirmed write is retried this often, up to this many attempts in all,
+// so a bus that is down cannot stall every caller of getCurrentTime()
+#define RV3028_RETRY_MILLIS  5000
+#define RV3028_MAX_TRIES  13
 
 static inline uint8_t bcd_to_dec(uint8_t bcd) {
   return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
@@ -307,8 +314,16 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
     if (!rv3028_good) return _fallback->getCurrentTime();
     const uint32_t now = rv3028_run_on();
     // An unconfirmed write may have left a mixed time in the chip, so the
-    // write is repeated until one is confirmed
-    if (rv3028_hold && rv3028_write_time(now)) rv3028_hold = false;
+    // write is repeated until one is confirmed, every RV3028_RETRY_MILLIS and
+    // at most RV3028_MAX_TRIES times. If none is, this boot runs on without
+    // the RTC.
+    if (rv3028_hold && rv3028_hold_tries < RV3028_MAX_TRIES
+        && millis() - rv3028_hold_millis >= RV3028_RETRY_MILLIS) {
+      rv3028_hold_millis = millis();
+      rv3028_hold_tries++;
+      if (rv3028_write_time(now)) rv3028_hold = false;
+      else if (rv3028_hold_tries == RV3028_MAX_TRIES) MESH_DEBUG_PRINTLN("RV3028: time write not confirmed, giving up");
+    }
     return now;
   }
 
@@ -331,6 +346,8 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
     // Until a write is confirmed the RTC is not read: this boot runs on from
     // the time being set, and getCurrentTime() repeats the write
     rv3028_hold = !rv3028_write_time(time);
+    rv3028_hold_millis = millis();
+    rv3028_hold_tries = 1;
     if (rv3028_hold) MESH_DEBUG_PRINTLN("RV3028: time write not confirmed, will retry");
     rv3028_good = true;
     rv3028_good_time = time;
