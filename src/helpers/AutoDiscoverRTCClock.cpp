@@ -24,6 +24,7 @@ static bool rtc_8130_success = false;
 #define RV3028_REG_SECONDS  0x00
 #define RV3028_NUM_CLOCK_REGS  7
 #define RV3028_REG_YEAR  0x06
+#define RV3028_YEAR_UNSET  0xA0  // not BCD, so no time write ever leaves it
 #define RV3028_REG_STATUS  0x0E
 #define RV3028_STATUS_BSF  0x20  // backup switchover flag
 
@@ -110,7 +111,7 @@ static uint32_t rv3028_run_on() {
 //
 // Returns 0 with unix_time set, 1 if the read was rejected for a set BSF that
 // is now clear, 2 if BSF is set and could not be cleared, -2 if the clock is
-// not set (year 00), or -1 if the transfer failed or the fields are not sane.
+// not set (year A0h), or -1 if the transfer failed or the fields are not sane.
 static int rv3028_read_clock(uint32_t& unix_time) {
   if (rv3028_wire == NULL) return -1;
   TwoWire& wire = *rv3028_wire;
@@ -137,6 +138,9 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   const uint8_t month = regs[5] & 0x1F;
   const uint8_t year  = regs[6];
 
+  // A0h is the mark a time write sets before its burst, so a write that was
+  // cut reads as a clock not yet set. Year 00 is 2000, a valid year.
+  if (year == RV3028_YEAR_UNSET) return -2;
   if (!is_bcd(secs) || !is_bcd(mins) || !is_bcd(hours)
       || !is_bcd(date) || !is_bcd(month) || !is_bcd(year)) {
     return -1;
@@ -144,9 +148,6 @@ static int rv3028_read_clock(uint32_t& unix_time) {
   // DateTime indexes its month table without checking, so the month is
   // range-checked before isValid() decodes it
   if (bcd_to_dec(month) < 1 || bcd_to_dec(month) > 12) return -1;
-  // Year 00 is the chip's reset state (manual 3.18, p. 41) and what a cut
-  // time write leaves, so it reads as a clock not yet set
-  if (year == 0) return -2;
 
   DateTime dt(2000 + bcd_to_dec(year), bcd_to_dec(month), bcd_to_dec(date),
               bcd_to_dec(hours), bcd_to_dec(mins), bcd_to_dec(secs));
@@ -164,15 +165,14 @@ static int rv3028_read_clock(uint32_t& unix_time) {
 }
 
 // Writes the clock registers, bracketed like a read: BSF is cleared first and
-// must still read 0 after the write. A switchover or power cut during a write
-// leaves the bytes written before it with the rest unchanged, a mixed time
-// that reads back as valid. So the year is zeroed first and written last: a
-// write cut after the zeroing leaves year 00, which reads as a clock not yet
-// set. This departs from writing the time in one access (manual 4.5, p. 52)
-// on purpose. The burst starts with Seconds, which resets the prescaler (3.3,
-// p. 14; 4.5.1, p. 53), so no tick lands between it and the year write that
-// follows at once. Only a tick between the zeroing and the burst could carry
-// into the year, and only from 31 December 23:59:59, leaving 2001.
+// must still read 0 after the write. A switchover during a write resets the
+// interface (manual 4.2, p. 45), as the bus timeout does (4.5.1, p. 53). Tested
+// on a bus timeout, each byte acked before the reset is already stored and the
+// rest keep their old values: a mixed time that reads back as valid. So the
+// year is first marked with A0h, which is not BCD and which the chip keeps
+// while the clock counts, and the time then goes in one access from Seconds to
+// Year, as 4.5 (p. 52) requires. Year is the last byte of that burst, so a
+// write cut anywhere in it leaves the mark, which reads as a clock not yet set.
 // Returns true only if the write is confirmed, trying twice.
 static bool rv3028_write_time(uint32_t time) {
   DateTime dt(time);
@@ -183,11 +183,10 @@ static bool rv3028_write_time(uint32_t time) {
   };
   for (int attempt = 0; attempt < 2; attempt++) {
     uint8_t status;
-    const uint8_t zero_year = 0;
+    const uint8_t unset_year = RV3028_YEAR_UNSET;
     if (rv3028_read_status(status) && rv3028_clear_bsf(status)
-        && rv3028_write_regs(RV3028_REG_YEAR, &zero_year, 1)
-        && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS - 1)
-        && rv3028_write_regs(RV3028_REG_YEAR, &regs[RV3028_NUM_CLOCK_REGS - 1], 1)
+        && rv3028_write_regs(RV3028_REG_YEAR, &unset_year, 1)
+        && rv3028_write_regs(RV3028_REG_SECONDS, regs, RV3028_NUM_CLOCK_REGS)
         && rv3028_read_status(status) && (status & RV3028_STATUS_BSF) == 0) {
       return true;
     }
