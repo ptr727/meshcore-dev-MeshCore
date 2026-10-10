@@ -269,7 +269,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       StrHelper::strncpy(_prefs->password, &command[9], sizeof(_prefs->password));
       savePrefs();
       sprintf(reply, "password now: ");
-      StrHelper::strncpy(&reply[14], _prefs->password, 160-15);   // echo back just to let admin know for sure!!
+      StrHelper::strncpy(&reply[14], _prefs->password, CLI_REPLY_SIZE-15);   // echo back just to let admin know for sure!!
     } else if (memcmp(command, "clear stats", 11) == 0) {
       _callbacks->clearStats();
       strcpy(reply, "(OK - stats reset)");
@@ -291,7 +291,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       const char* solar_state = _board->hasSolarChargerDetect()
                                     ? (_board->isSolarChargerActive() ? "yes" : "no")
                                     : "n/a";
-      snprintf(reply, 160, "batt:%u mV usb:%s solar_chg:%s ext:%s charger:%s",
+      snprintf(reply, CLI_REPLY_SIZE, "batt:%u mV usb:%s solar_chg:%s ext:%s charger:%s",
               (unsigned)_board->getBattMilliVolts(),
               usb_state,
               solar_state,
@@ -373,11 +373,11 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       if (l != NULL) {
         const char* setting = _sensors->getSettingByKey("gps");
         bool requested = setting != NULL && strcmp(setting, "1") == 0;
-        int prefix_len = snprintf(reply, 160, "req:%u ", requested ? 1U : 0U);
-        if (prefix_len < 0 || prefix_len >= 160) {
-          reply[159] = 0;
+        int prefix_len = snprintf(reply, CLI_REPLY_SIZE, "req:%u ", requested ? 1U : 0U);
+        if (prefix_len < 0 || prefix_len >= CLI_REPLY_SIZE) {
+          reply[CLI_REPLY_SIZE - 1] = 0;
         } else {
-          l->formatDiagnostics(reply + prefix_len, 160 - prefix_len);
+          l->formatDiagnostics(reply + prefix_len, CLI_REPLY_SIZE - prefix_len);
         }
       } else {
         strcpy(reply, "gps provider not found");
@@ -694,7 +694,7 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
   #endif
   } else {
     strcpy(reply, "unknown config: ");
-    StrHelper::strncpy(&reply[16], config, 160-17);
+    StrHelper::strncpy(&reply[16], config, CLI_REPLY_SIZE-17);
   }
 }
 
@@ -732,7 +732,7 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
     *reply++ = '>';
     *reply++ = ' ';
     const char* sp = _prefs->owner_info;
-    while (*sp && reply - start < 159) {
+    while (*sp && reply - start < CLI_REPLY_SIZE - 1) {
       *reply++ = (*sp == '\n') ? '|' : *sp;    // translate newline back to orig '|'
       sp++;
     }
@@ -869,16 +869,16 @@ static char* splitNameJump(char* tok) {
 static bool processRegionDefSegment(RegionMap* map, char* tok, RegionEntry** cursor, char* reply) {
   char* jump = splitNameJump(tok);
   char* name = skipSpaces(tok);
-  if (*name == '\0') { snprintf(reply, 160, "Err - empty name"); return false; }
-  if (jump && *jump == '\0') { snprintf(reply, 160, "Err - empty jump"); return false; }
+  if (*name == '\0') { snprintf(reply, CLI_REPLY_SIZE, "Err - empty name"); return false; }
+  if (jump && *jump == '\0') { snprintf(reply, CLI_REPLY_SIZE, "Err - empty jump"); return false; }
 
   RegionEntry* r = map->putRegion(name, (*cursor)->id);
-  if (r == NULL) { snprintf(reply, 160, "Err - put failed: %s", name); return false; }
+  if (r == NULL) { snprintf(reply, CLI_REPLY_SIZE, "Err - put failed: %s", name); return false; }
   r->flags = 0;
 
   if (jump) {
     RegionEntry* j = map->findByNamePrefix(jump);
-    if (j == NULL) { snprintf(reply, 160, "Err - unknown jump: %s", jump); return false; }
+    if (j == NULL) { snprintf(reply, CLI_REPLY_SIZE, "Err - unknown jump: %s", jump); return false; }
     *cursor = j;
   } else {
     *cursor = r;
@@ -894,20 +894,20 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
   if (strncmp(cmd, "region def", 10) == 0 && (cmd[10] == ' ' || cmd[10] == '\0')) {
     char* payload = skipSpaces(cmd + 10);
     rtrimSpaces(payload);
-    if (*payload == '\0') { snprintf(reply, 160, "Err - empty def"); return; }
+    if (*payload == '\0') { snprintf(reply, CLI_REPLY_SIZE, "Err - empty def"); return; }
 
     RegionEntry* cursor = &_region_map->getWildcard();
     for (char* tok; (tok = takeToken(&payload)) != nullptr; ) {
       if (!processRegionDefSegment(_region_map, tok, &cursor, reply)) return;
     }
-    _region_map->exportTo(reply, 160);
+    _region_map->exportTo(reply, CLI_REPLY_SIZE);
     return;
   }
 
   const char* parts[4];
   int n = mesh::Utils::parseTextParts(command, parts, 4, ' ');
   if (n == 1) {
-    _region_map->exportTo(reply, 160);
+    _region_map->exportTo(reply, CLI_REPLY_SIZE);
   } else if (n >= 2 && strcmp(parts[1], "load") == 0) {
     _callbacks->startRegionsLoad();
   } else if (n >= 2 && strcmp(parts[1], "save") == 0) {
@@ -1017,7 +1017,7 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
       return;
     }
     
-    int len = _region_map->exportNamesTo(reply, 160, mask, invert);
+    int len = _region_map->exportNamesTo(reply, CLI_REPLY_SIZE, mask, invert);
     if (len == 0) {
       strcpy(reply, "-none-");
     }
