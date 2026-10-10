@@ -22,6 +22,11 @@
 #define LOOP_DETECT_MODERATE  2
 #define LOOP_DETECT_STRICT    3
 
+// Room for a CommonCLI reply, NUL included. The serial callers pass a 160-byte buffer and the
+// remote callers 161 bytes, and each first reflects an optional 3-byte "xx|" prefix and advances
+// `reply` past it, so the callee can rely on 157 bytes only.
+#define CLI_REPLY_SIZE  157
+
 class NodePrefs : public ConfigSerializer {
 public:
   // in-memory backing data
