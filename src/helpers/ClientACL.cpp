@@ -39,6 +39,10 @@ void ClientACL::load(FILESYSTEM* fs, const mesh::LocalIdentity& self_id) {
 
         if (!success) break; // EOF
 
+        if (c.out_path_len != OUT_PATH_UNKNOWN && !mesh::Packet::isValidPathLen(c.out_path_len)) {
+          c.out_path_len = OUT_PATH_UNKNOWN;  // corrupt entry: rediscover the path rather than send DIRECT on a bad one
+        }
+
         c.id = mesh::Identity(pub_key);
         self_id.calcSharedSecret(c.shared_secret, pub_key);  // recalculate shared secrets in case our private key changed
         if (num_clients < MAX_CLIENTS) {
