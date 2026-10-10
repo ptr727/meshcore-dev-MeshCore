@@ -116,6 +116,10 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
 
           if (!success) break;  // EOF
 
+          if (c.out_path_len != OUT_PATH_UNKNOWN && !mesh::Packet::isValidPathLen(c.out_path_len)) {
+            c.out_path_len = OUT_PATH_UNKNOWN;  // corrupt entry: rediscover the path rather than send DIRECT on a bad one
+          }
+
           c.id = mesh::Identity(pub_key);
           c.lastmod = 0;
           if (!addContact(c)) full = true;
